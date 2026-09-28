@@ -53,6 +53,7 @@ pub const Player = struct {
     worker: ?std.Thread = null,
 
     applied_seek_generation: u64 = 0,
+    warned_seek_generation: u64 = 0,
 
     pub fn init(io: std.Io, allocator: Allocator) Player {
         return .{
@@ -241,6 +242,9 @@ pub const Player = struct {
             selected_index = self.command.current_index;
             self.command.current_index = null;
 
+            // Do NOT mark the request applied here: it must stay pending
+            // until a video actually consumes it (see below), otherwise a
+            // seek that arrives before/while a video loads is lost.
             if (self.command.seek_generation !=
                 self.applied_seek_generation)
             {
@@ -248,9 +252,6 @@ pub const Player = struct {
                     .generation = self.command.seek_generation,
                     .position = self.command.seek_position,
                 };
-
-                self.applied_seek_generation =
-                    self.command.seek_generation;
             }
 
             speed = self.command.speed;
@@ -270,12 +271,30 @@ pub const Player = struct {
                 {
                     self.setActiveVideo(index);
                     last_pts = null;
+                } else {
+                    std.log.warn(
+                        "N {d} ignored: no loaded video at that index",
+                        .{index},
+                    );
                 }
             }
 
             const active = self.getActiveVideo();
 
             if (active == null) {
+                if (seek_request) |request| {
+                    if (self.warned_seek_generation !=
+                        request.generation)
+                    {
+                        self.warned_seek_generation = request.generation;
+
+                        std.log.warn(
+                            "seek {d:.4} held: no active video; it will apply once one is loaded",
+                            .{request.position},
+                        );
+                    }
+                }
+
                 self.sleepNs(1_000_000);
                 continue;
             }
@@ -283,6 +302,10 @@ pub const Player = struct {
             const v = active.?;
 
             if (seek_request) |request| {
+                self.mutex.lockUncancelable(self.io);
+                self.applied_seek_generation = request.generation;
+                self.mutex.unlock(self.io);
+
                 const startNs = self.nowNs();
 
                 const meta = v.seekNormalized(
@@ -314,10 +337,7 @@ pub const Player = struct {
 
                 last_pts = meta.pts;
 
-                // seekNormalized doesn't publish. Publish the target frame
-                // through the normal mailbox path.
-                v.mailbox.publish(v.frame, meta);
-
+                // seekNormalized already published the target frame.
                 continue;
             }
 
@@ -329,7 +349,7 @@ pub const Player = struct {
             const decode_start = self.nowNs();
 
             const meta = v.decodeAndPublish() catch |err| {
-                if (err == error.EndOfVideo) {
+                if (err == error.EndOfStream) {
                     // Loop to the beginning for the MVP.
                     _ = v.seekNormalized(0) catch {};
                     last_pts = null;

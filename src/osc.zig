@@ -167,6 +167,9 @@ pub const OscServer = struct {
             }
 
             const path = try readOscString(packet, &pos);
+
+            log.debug("/load {s}", .{path});
+
             self.player.requestLoad(path);
             return;
         }
@@ -181,6 +184,8 @@ pub const OscServer = struct {
             if (value < 0) {
                 return error.InvalidArguments;
             }
+
+            log.debug("/n {d}", .{value});
 
             self.player.requestSelect(@intCast(value));
             return;
@@ -197,6 +202,8 @@ pub const OscServer = struct {
                 else => return error.InvalidArguments,
             };
 
+            log.debug("/seek {d:.6}", .{value});
+
             self.player.requestSeek(value);
             return;
         }
@@ -211,6 +218,8 @@ pub const OscServer = struct {
                 'i' => @floatFromInt(try readI32(packet, &pos)),
                 else => return error.InvalidArguments,
             };
+
+            log.debug("/speed {d:.6}", .{value});
 
             self.player.requestSpeed(value);
             return;
@@ -254,7 +263,12 @@ fn readI32(packet: []const u8, pos: *usize) !i32 {
         return error.TruncatedPacket;
     }
 
-    const value: i32 = @bitCast(packet[pos.*..][0..4].*);
+    // OSC argument types are big-endian by specification.
+    const value = std.mem.readInt(
+        i32,
+        &packet[pos.*..][0..4].*,
+        .big,
+    );
 
     pos.* += 4;
     return value;

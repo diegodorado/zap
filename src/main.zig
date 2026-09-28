@@ -53,6 +53,8 @@ pub fn main(init: std.process.Init) !void {
     var player = Player.init(io, allocator);
     defer player.deinit();
 
+    try player.start();
+
     var audio = try AudioManager.init();
     defer audio.deinit();
 

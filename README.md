@@ -1,4 +1,4 @@
-# zigvideo
+# zap
 
 Small, low-latency OSC-controlled macOS video player written in Zig.
 
@@ -26,13 +26,24 @@ This is intentionally NOT a general-purpose media player.
 - normalized position seeking
 - decoder flushing after seek
 - obsolete seek requests collapse to the newest request
+- a seek issued before or while a video loads is held and applied on load
 - planar YUV420P presentation
 - two-slot decoded-frame mailbox
 - basic playback timing
 - arbitrary random seeking
+- playback wraps to the beginning at end of file
 - benchmark mode
 - benchmark min/median/p95/max reporting
 - explicit resource cleanup
+
+### Known gaps
+
+- There are no automated tests and no `zig build test` step. Everything
+  listed above is verified by hand; see "Verification".
+- `/load`, `/n`, `/seek` and `/speed` are the only inputs. There is no
+  keyboard control in the SDL window other than quitting.
+- Debug-level logs are compiled out in `-Doptimize=ReleaseFast`. Only
+  `info` and `warning` are visible in a release build.
 
 ### Not implemented yet
 
@@ -59,16 +70,23 @@ Primary target:
 
 - macOS
 - Apple Silicon
-- Zig 0.16.0
+- Zig 0.17.0-dev
 - Homebrew
 
-Zig 0.16.0 is the intended compiler version.
+The code targets the Zig 0.17.0 development series (developed against
+0.17.0-dev.1099+7db2ef610). It uses the `std.Io` interfaces introduced in
+0.17: `std.Io.Mutex` for the mailbox and player state, and
+`Io.sleep` / `Clock.now` for pacing and timing. It will not build on 0.16.
 
 Install dependencies:
 
     brew install zig
     brew install sdl3
     brew install ffmpeg
+
+Optional, for sending OSC by hand:
+
+    brew install liblo   # provides oscsend
 
 Verify:
 
@@ -80,9 +98,9 @@ The default build assumes Apple Silicon Homebrew:
 
     /opt/homebrew
 
-For Intel Homebrew:
-
-    zig build -Dbrew-prefix=/usr/local
+That prefix is hardcoded as `brew_prefix` in `build.zig`. There is no
+`-Dbrew-prefix` build option. On an Intel Homebrew installation, change
+`brew_prefix` in `build.zig` to `/usr/local` before building.
 
 ---
 
@@ -102,7 +120,7 @@ Run:
 
 or:
 
-    zig-out/bin/zigvideo
+    ./zig-out/bin/zap
 
 To load a video immediately:
 
@@ -110,7 +128,65 @@ To load a video immediately:
 
 The executable can also be invoked directly:
 
-    ./zig-out/bin/zigvideo /Users/me/Videos/clip01.mp4
+    ./zig-out/bin/zap /Users/me/Videos/clip01.mp4
+
+---
+
+# Verification
+
+There is no automated test suite yet. The two checks below cover the parts
+that actually break: the FFmpeg/SDL path, and the OSC control path.
+
+## 1. Headless: seek benchmark
+
+This does not open a window. It exercises demux, seek, decode, frame
+mailbox and the monotonic clock:
+
+    zig build -Doptimize=ReleaseFast
+    ./zig-out/bin/zap --benchmark /Users/me/Videos/clip01.mp4
+
+Expected shape:
+
+    info(video): opened ...: 1920x1080, fps=30.000, duration=...
+    Results: seek -> decoded target frame
+         min: 1.2 ms
+      median: 12.0 ms
+         p95: 20.2 ms
+         max: 21.5 ms
+
+It performs 100 deterministic pseudo-random seeks (fixed seed, so runs are
+comparable). Targets are clamped to 95% of the file, because a seek past
+the last decodable frame has nothing to decode and yields
+`error.EndOfStream`; any such sample is skipped and reported as `skipped=N`
+rather than being folded into the percentiles.
+
+## 2. Live: OSC control
+
+Start the player with a video, then drive it:
+
+    ./zig-out/bin/zap /Users/me/Videos/clip01.mp4
+
+In another terminal:
+
+    oscsend 127.0.0.1 9000 "/seek" f 0.5
+    oscsend 127.0.0.1 9000 "/speed" f 0.0     # pause
+    oscsend 127.0.0.1 9000 "/speed" f 2.0
+    oscsend 127.0.0.1 9000 "/n" i 0
+
+`/seek` and `/speed` are logged as `debug`, which is compiled out of
+release builds. In a release build, confirm control with the `info` line
+the video worker emits when a seek is actually applied:
+
+    info: SEEK request=1 position=0.500000 frame_pts=46080 latency_ms=3.549
+
+If a command cannot take effect, the player says so at `warning` level,
+which is visible in every build mode:
+
+    warning: seek 0.5000 held: no active video; it will apply once one is loaded
+    warning: N 5 ignored: no loaded video at that index
+
+A quiet log after a command means the packet never arrived. Check that the
+sender targets UDP 9000 on the same host.
 
 ---
 
@@ -121,6 +197,13 @@ OSC listens on:
     UDP 9000
 
 All video indexes are zero-based.
+
+### Wire format
+
+Argument values are decoded per the OSC 1.0 specification: `int32` and
+`float32` are **big-endian**. This is the opposite of the host byte order
+on Apple Silicon, so a decoder must byte-swap explicitly. Getting this
+wrong does not fail loudly, it produces silently wrong positions.
 
 ## /load
 
@@ -148,6 +231,11 @@ Indexing is zero-based.
 
 Only the active video is decoded.
 
+An index with no loaded video behind it is refused, and the refusal is
+logged:
+
+    warning: N 5 ignored: no loaded video at that index
+
 ---
 
 ## /seek
@@ -174,6 +262,17 @@ For example:
 
 will not intentionally decode all four targets.
 
+A seek that arrives when no video is active is not dropped. It stays
+pending and is applied as soon as a video is active, so this ordering is
+well defined and is the normal way to script a load and a jump together:
+
+    /seek 0.5
+    /load "/Users/me/Videos/clip01.mp4"
+
+Both orders work. Sending `/load` and `/seek` in quick succession is safe
+even though opening and finding stream info take tens of milliseconds,
+which is longer than the gap between two OSC packets.
+
 ---
 
 ## /speed
@@ -196,7 +295,10 @@ double speed
 
 pause
 
-Negative playback is currently rejected.
+Negative playback is currently rejected with a warning.
+
+`speed` and `playing` are player state, not per-video state, so a speed
+set before a video is loaded applies to whatever loads next.
 
 Audio speed behavior is not currently applicable because the CoreAudio
 backend is not implemented yet.
@@ -313,7 +415,7 @@ Run:
 
 Then:
 
-    ./zig-out/bin/zigvideo --benchmark /Users/me/Videos/clip01.mp4
+    ./zig-out/bin/zap --benchmark /Users/me/Videos/clip01.mp4
 
 The benchmark performs 100 deterministic random seeks.
 
@@ -335,6 +437,9 @@ It reports:
     max
 
 Display/vsync latency is intentionally excluded.
+
+See "Verification" for the full expected output, including the `skipped=N`
+count for seek targets with no decodable frame behind them.
 
 ---
 
