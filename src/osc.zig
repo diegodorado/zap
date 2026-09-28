@@ -161,71 +161,108 @@ pub const OscServer = struct {
             return error.InvalidTypeTags;
         }
 
-        if (std.mem.eql(u8, address, "/load")) {
-            if (typetags.len != 2 or typetags[1] != 's') {
-                return error.InvalidArguments;
+        // OSC 1.0 allows an 8-byte timetag immediate between the typetag
+        // string and the arguments, and the reader that zap mirrors treats it
+        // as optional. It is only recognized as a timetag when the top bit of
+        // the seconds word is clear and the top bit of the fraction word is
+        // set; anything else is argument data. A string or float argument
+        // cannot pass that test, so this cannot misfire on a packet that has
+        // no timetag.
+        if (pos + 8 <= packet.len) {
+            const seconds = packet[pos..][0..4];
+            const fraction = packet[pos + 4 ..][0..4];
+
+            if ((seconds[0] & 0x80) == 0 and (fraction[0] & 0x80) != 0) {
+                pos += 8;
             }
-
-            const path = try readOscString(packet, &pos);
-
-            log.debug("/load {s}", .{path});
-
-            self.player.requestLoad(path);
-            return;
         }
 
-        if (std.mem.eql(u8, address, "/n")) {
-            if (typetags.len != 2 or typetags[1] != 'i') {
-                return error.InvalidArguments;
-            }
-
-            const value = try readI32(packet, &pos);
-
-            if (value < 0) {
-                return error.InvalidArguments;
-            }
-
-            log.debug("/n {d}", .{value});
-
-            self.player.requestSelect(@intCast(value));
-            return;
-        }
-
-        if (std.mem.eql(u8, address, "/seek")) {
-            if (typetags.len != 2) {
-                return error.InvalidArguments;
-            }
-
-            const value: f64 = switch (typetags[1]) {
-                'f' => @floatCast(try readF32(packet, &pos)),
-                'i' => @floatFromInt(try readI32(packet, &pos)),
-                else => return error.InvalidArguments,
-            };
-
-            log.debug("/seek {d:.6}", .{value});
-
-            self.player.requestSeek(value);
-            return;
-        }
-
-        if (std.mem.eql(u8, address, "/speed")) {
-            if (typetags.len != 2) {
-                return error.InvalidArguments;
-            }
-
-            const value: f64 = switch (typetags[1]) {
-                'f' => @floatCast(try readF32(packet, &pos)),
-                'i' => @floatFromInt(try readI32(packet, &pos)),
-                else => return error.InvalidArguments,
-            };
-
-            log.debug("/speed {d:.6}", .{value});
-
-            self.player.requestSpeed(value);
+        if (std.mem.eql(u8, address, "/play")) {
+            try self.parsePlayEvent(packet, typetags, &pos);
             return;
         }
 
         log.debug("unknown OSC address: {s}", .{address});
+    }
+
+    /// `/play` as SuperDirt sends it: a flat list of key/value pairs, in any
+    /// order, where the value's type is not known until the key is read.
+    ///
+    ///     /play s "s" s "bd3" s "begin" f 0.2 s "end" f 0.4 s "delta" f 0.5
+    ///
+    /// Keys zap does not use are still fully consumed. Skipping the value of
+    /// an unrecognized key would leave the reader mid-packet, and every later
+    /// field would be garbage.
+    fn parsePlayEvent(
+        self: *OscServer,
+        packet: []const u8,
+        typetags: []const u8,
+        pos: *usize,
+    ) !void {
+        const arg_tags = typetags[1..];
+
+        if (arg_tags.len % 2 != 0) return error.InvalidArguments;
+
+        var name: []const u8 = "";
+        var begin: ?f64 = null;
+        var end: ?f64 = null;
+        var n: ?f64 = null;
+        var delta: ?f64 = null;
+        var legato: ?f64 = null;
+
+        var i: usize = 0;
+        while (i < arg_tags.len) : (i += 2) {
+            if (arg_tags[i] != 's') return error.InvalidArguments;
+
+            const key = try readOscString(packet, pos);
+
+            switch (arg_tags[i + 1]) {
+                's' => {
+                    const value = try readOscString(packet, pos);
+                    if (std.mem.eql(u8, key, "s")) name = value;
+                },
+                'i' => {
+                    _ = try readI32(packet, pos);
+                },
+                'f', 'd' => {
+                    const value: f64 = switch (arg_tags[i + 1]) {
+                        'f' => @floatCast(try readF32(packet, pos)),
+                        else => try readF64(packet, pos),
+                    };
+
+                    if (std.mem.eql(u8, key, "begin")) {
+                        begin = value;
+                    } else if (std.mem.eql(u8, key, "end")) {
+                        end = value;
+                    } else if (std.mem.eql(u8, key, "n")) {
+                        n = value;
+                    } else if (std.mem.eql(u8, key, "delta")) {
+                        delta = value;
+                    } else if (std.mem.eql(u8, key, "legato")) {
+                        legato = value;
+                    }
+                },
+                'h' => _ = try readI64(packet, pos),
+                'c' => _ = try readChar(packet, pos),
+                // Timetags and the no-payload pseudo-types.
+                'T', 'F', 'N', 'I' => {},
+                else => return error.UnsupportedType,
+            }
+        }
+
+        // duration is derived, never transmitted: SuperDirt plays a grain for
+        // delta * legato, so a video slice has to last exactly as long.
+        const duration = (delta orelse 0) * (legato orelse 1);
+
+        // `n` is optional: an absent key is the same as 0, which is
+        // SuperDirt's own default for it.
+        self.player.requestTrigger(
+            name,
+            begin orelse 0,
+            end orelse 1,
+            n orelse 0,
+            duration,
+        );
     }
 };
 
@@ -274,7 +311,47 @@ fn readI32(packet: []const u8, pos: *usize) !i32 {
     return value;
 }
 
+fn readI64(packet: []const u8, pos: *usize) !i64 {
+    if (pos.* + 8 > packet.len) {
+        return error.TruncatedPacket;
+    }
+
+    const value = std.mem.readInt(
+        i64,
+        &packet[pos.*..][0..8].*,
+        .big,
+    );
+
+    pos.* += 8;
+    return value;
+}
+
+fn readChar(packet: []const u8, pos: *usize) !u8 {
+    if (pos.* + 4 > packet.len) {
+        return error.TruncatedPacket;
+    }
+
+    pos.* += 4;
+    return packet[pos.* - 4];
+}
+
 fn readF32(packet: []const u8, pos: *usize) !f32 {
     const bits: u32 = @bitCast(try readI32(packet, pos));
+    return @bitCast(bits);
+}
+
+fn readF64(packet: []const u8, pos: *usize) !f64 {
+    if (pos.* + 8 > packet.len) {
+        return error.TruncatedPacket;
+    }
+
+    // OSC floats and doubles are big-endian by specification.
+    const bits = std.mem.readInt(
+        u64,
+        &packet[pos.*..][0..8].*,
+        .big,
+    );
+
+    pos.* += 8;
     return @bitCast(bits);
 }

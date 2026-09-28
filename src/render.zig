@@ -41,6 +41,22 @@ pub const Renderer = struct {
 
         errdefer c.SDL_DestroyRenderer(renderer);
 
+        // Vsync is not optional here. Without it SDL_RenderPresent returns
+        // immediately, the loop runs at several hundred Hz, and the same
+        // source frame is re-uploaded and presented many times per display
+        // refresh, which is what makes the picture flicker instead of hold.
+        if (!c.SDL_SetRenderVSync(renderer, 1)) {
+            log.warn(
+                "could not enable vsync: {s}; presentation may flicker",
+                .{c.SDL_GetError()},
+            );
+        }
+
+        var vsync: i32 = 0;
+        if (c.SDL_GetRenderVSync(renderer, &vsync) and vsync == 0) {
+            log.warn("vsync is off; presentation is not frame-locked", .{});
+        }
+
         // Fixed source resolution, preserving aspect ratio.
         _ = c.SDL_SetRenderLogicalPresentation(
             renderer,

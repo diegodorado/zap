@@ -14,24 +14,24 @@ This is intentionally NOT a general-purpose media player.
 - Zig implementation
 - SDL3 window and rendering
 - OSC UDP receiver
-- `/load`
-- `/n`
-- `/seek`
-- `/speed`
-- asynchronous video loading
+- `/play` single-event trigger: SuperDirt key/value pairs, any order
+- sample-name resolution against a media directory (`--media`)
+- a named clip is opened once and reused by later triggers
+- normalized slice playback (`begin` .. `end`) with the last frame held
+- wall-clock `duration` cutoff
+- an event naming a sample that does not exist is dropped without touching
+  the picture
+- exact-frame seeking: keyframe backward, then decode forward to the target
 - persistent FFmpeg demuxer/decoder
 - H.264 decoding
-- 1920x1080 validation
+- resolution validation (any even size up to 3840x2160)
+- 30 fps source contract, enforced with a warning
 - fixed-FPS metadata
-- normalized position seeking
 - decoder flushing after seek
-- obsolete seek requests collapse to the newest request
-- a seek issued before or while a video loads is held and applied on load
+- absolute-deadline frame pacing
 - planar YUV420P presentation
 - two-slot decoded-frame mailbox
-- basic playback timing
-- arbitrary random seeking
-- playback wraps to the beginning at end of file
+- vsync-locked presentation
 - benchmark mode
 - benchmark min/median/p95/max reporting
 - explicit resource cleanup
@@ -40,27 +40,22 @@ This is intentionally NOT a general-purpose media player.
 
 - There are no automated tests and no `zig build test` step. Everything
   listed above is verified by hand; see "Verification".
-- `/load`, `/n`, `/seek` and `/speed` are the only inputs. There is no
-  keyboard control in the SDL window other than quitting.
+- `/play` is the only OSC address. There is no keyboard control in the SDL
+  window other than quitting.
+- Audio is not handled here at all. SuperDirt plays the matching WAV; see
+  "Audio".
 - Debug-level logs are compiled out in `-Doptimize=ReleaseFast`. Only
   `info` and `warning` are visible in a release build.
 
 ### Not implemented yet
 
 - VideoToolbox hardware decoding
-- CoreAudio audio decoding/output
-- audio clock
-- A/V synchronization
-- variable playback-speed audio
 - reverse playback
 - frame-accurate presentation scheduling
 - GPU-native VideoToolbox -> Metal texture path
-- advanced GOP validation
 - configuration files
 - playlists
 - effects
-
-The first milestone deliberately concentrates on the video path.
 
 ---
 
@@ -130,6 +125,13 @@ The executable can also be invoked directly:
 
     ./zig-out/bin/zap /Users/me/Videos/clip01.mp4
 
+To play samples by name from a media directory:
+
+    ./zig-out/bin/zap --media /Users/me/Videos
+
+The directory is searched for `<name>.mp4` when a `/play` event omits a
+path. It defaults to `media`.
+
 ---
 
 # Verification
@@ -162,31 +164,40 @@ rather than being folded into the percentiles.
 
 ## 2. Live: OSC control
 
-Start the player with a video, then drive it:
+Start the player against a media directory, then drive it:
 
-    ./zig-out/bin/zap /Users/me/Videos/clip01.mp4
+    ./zig-out/bin/zap --media /Users/me/Videos
 
 In another terminal:
 
-    oscsend 127.0.0.1 9000 "/seek" f 0.5
-    oscsend 127.0.0.1 9000 "/speed" f 0.0     # pause
-    oscsend 127.0.0.1 9000 "/speed" f 2.0
-    oscsend 127.0.0.1 9000 "/n" i 0
+    oscsend 127.0.0.1 9000 "/play" s "s" s "clip01" s "begin" f 0.25 s "end" f 0.75
+    oscsend 127.0.0.1 9000 "/play" s "s" s "clip01" s "delta" f 0.25 s "legato" f 0.5
+    oscsend 127.0.0.1 9000 "/play" s "n" f 0 s "begin" f 0.5
 
-`/seek` and `/speed` are logged as `debug`, which is compiled out of
-release builds. In a release build, confirm control with the `info` line
-the video worker emits when a seek is actually applied:
+Every `/play` is logged, and the worker logs the frame it actually landed
+on, which is the thing worth checking:
 
-    info: SEEK request=1 position=0.500000 frame_pts=46080 latency_ms=3.549
+    info: TRIGGER #1 s=clip01 begin=0.2500 end=0.7500 n=null duration=0.000
+    info: trigger #1 began at 3.000s / 4.000s, frame_pts=46080, latency=2.10ms
 
-If a command cannot take effect, the player says so at `warning` level,
-which is visible in every build mode:
+`begin=0.25` landing on 25% of the stream is the assertion that matters: if
+that number is off, the seek is snapping to a keyframe instead of landing on
+the requested frame.
 
-    warning: seek 0.5000 held: no active video; it will apply once one is loaded
-    warning: N 5 ignored: no loaded video at that index
+If an event cannot take effect, the player says so at `warning` level, which
+is visible in every build mode:
+
+    warning: trigger #7: s "bd" n=null is not in 'media'; event ignored
+    warning: trigger #6: n=9 is past the end of 'media'; event ignored
 
 A quiet log after a command means the packet never arrived. Check that the
 sender targets UDP 9000 on the same host.
+
+Note that `oscsend` requires an explicit type tag before every value,
+including the key strings, so an event is verbose to type by hand. A bare
+number is silently not sent at all, and the event arrives with fewer
+arguments than you wrote. For anything beyond a smoke test, send from Tidal
+or a small script rather than by hand.
 
 ---
 
@@ -196,112 +207,118 @@ OSC listens on:
 
     UDP 9000
 
-All video indexes are zero-based.
+The port is hardcoded, so only one zap instance can bind it at a time.
 
 ### Wire format
 
-Argument values are decoded per the OSC 1.0 specification: `int32` and
-`float32` are **big-endian**. This is the opposite of the host byte order
-on Apple Silicon, so a decoder must byte-swap explicitly. Getting this
-wrong does not fail loudly, it produces silently wrong positions.
+Argument values are decoded per the OSC 1.0 specification: `int32`,
+`float32` and `float64` are **big-endian**. This is the opposite of the host
+byte order on Apple Silicon, so a decoder must byte-swap explicitly. Getting
+this wrong does not fail loudly, it produces silently wrong positions.
 
-## /load
+## /play
 
-Load a video asynchronously.
+The only address zap answers. It carries one grain: which sample, which slice
+of it, which occurrence, and how long it lasts.
 
-    /load "path/to/video.mp4"
+Fields are sent as **key/value pairs in any order**, exactly as SuperDirt
+receives them. Each pair is a string key followed by a value whose type is
+part of the typetag string:
 
-Example:
+    /play s "s" s "bd3" s "begin" f 0.2 s "end" f 0.4 s "delta" f 0.5
 
-    /load "/Users/me/Videos/clip01.mp4"
+zap reads these keys:
 
-The file is opened and its decoder remains alive.
+| key      | type  | default | meaning                                    |
+|----------|-------|---------|--------------------------------------------|
+| `s`      | `s`   | none    | sample name or path; omit to reuse the clip |
+| `begin`  | `f`   | `0`     | normalized start position                  |
+| `end`    | `f`   | `1`     | normalized end position                    |
+| `n`      | `f`   | `0`     | sample number; only > 0 selects by index   |
+| `delta`  | `f`   | `0`     | event length in seconds                    |
+| `legato` | `f`   | `1`     | length multiplier                          |
 
----
+Every other key Tidal sends (`cps`, `midichan`, `note`, `velocity`,
+`cc*`, `octave`, ...) is fully read and thrown away. That matters: skipping
+the *value* of an unrecognized key would leave the reader misaligned, and
+every field after it would be garbage.
 
-## /n
+`duration` is never transmitted. It is derived, the way SuperDirt derives
+it:
 
-Select an already loaded video.
+    duration = delta * legato
 
-    /n 0
-    /n 1
-    /n 2
+so a video slice lasts exactly as long as the grain it belongs to. A bare
+`/play s "bd"` with no `delta` plays the whole slice.
 
-Indexing is zero-based.
+Sending `/load`, `/seek` or `/speed` does nothing. They are gone.
 
-Only the active video is decoded.
+### Types
 
-An index with no loaded video behind it is refused, and the refusal is
-logged:
+`i` (int32), `f` (float32) and `d` (float64) are all accepted for any
+numeric key, because a sender's choice of width should not change behavior.
+Only the key decides what a value means.
 
-    warning: N 5 ignored: no loaded video at that index
+An optional 8-byte OSC timetag between the typetag string and the arguments
+is recognized and skipped, using the OSC 1.0 test for an "immediate"
+timetag: top bit of the seconds word clear, top bit of the fraction word
+set. A packet without one parses identically.
 
----
+### Resolving `s`
 
-## /seek
+If `s` contains a `/` or ends in `.mp4` it is treated as a path. Otherwise
+it is a sample name looked up in the media directory (`--media`, default
+`media`) as `<name>.mp4`.
 
-Seek using normalized media position.
+Omitting `s` reuses the clip that is already loaded. A clip is opened once;
+later events naming the same sample reuse the open decoder instead of
+re-reading the file.
 
-    /seek 0.0
-    /seek 0.5
-    /seek 0.95
-    /seek 1.0
+A sample name that does not resolve drops the whole event. The picture
+currently on screen is left completely untouched, because half-applying a
+mistyped event (restarting the current clip) is worse than doing nothing:
 
-The value is NOT a frame number.
+    warning: trigger #7: s "bd" n=null is not in 'media'; event ignored
 
-It is mapped onto the video's actual stream duration.
+### `begin` and `end`
 
-Rapid seeks collapse to the newest request.
+Both are normalized positions in `0..1` mapped onto that clip's stream
+duration. They are not frame numbers.
 
-For example:
+`end` defaults to `1`, so an event with no `end` plays to the end of the
+clip. Once the slice reaches `end` the last frame is held until the next
+event. There is no auto-loop: a sample plays its slice once and waits,
+because looping on its own would fight the pattern that drives zap.
 
-    /seek 0.1
-    /seek 0.8
-    /seek 0.3
-    /seek 0.95
+`end` is a position and `duration` is a wall-clock cutoff, so whichever
+arrives first wins.
 
-will not intentionally decode all four targets.
+### `n`
 
-A seek that arrives when no video is active is not dropped. It stays
-pending and is applied as soon as a video is active, so this ordering is
-well defined and is the normal way to script a load and a jump together:
+`n` is an absolute sample number: the index of a file in the media
+directory, counting `.mp4` files in sorted order.
 
-    /seek 0.5
-    /load "/Users/me/Videos/clip01.mp4"
+    /play s "n" f 0 f "begin" f 0 s "n" f 3    # the 4th .mp4
 
-Both orders work. Sending `/load` and `/seek` in quick succession is safe
-even though opening and finding stream info take tens of milliseconds,
-which is longer than the gap between two OSC packets.
+`n` is optional and defaults to `0`, so an event with no `n` and an event
+with `n 0` are the same request.
 
----
+`n` addresses a file directly, so it makes a name redundant: **when `n` is
+greater than 0, `s` on the same event is ignored.** A real SuperDirt event
+carries both, which is fine, because zap only needs the number.
 
-## /speed
+`0` selects nothing, because it is SuperDirt's own default and Tidal sends
+`n` on every event. Treating 0 as "the first file" would make every event
+resolve to the first clip in the directory and the name would never be
+used. So 0 leaves the name in charge.
 
-Playback speed:
+The listing is sorted, so index `0` is the alphabetically first `.mp4` in
+the media directory and indices are stable as long as the file set is. An
+index past the end of the listing is refused, never clamped, because
+silently playing the last file would look like a working event while
+showing the wrong clip:
 
-    /speed 1.0
-
-normal playback
-
-    /speed 0.5
-
-half speed
-
-    /speed 2.0
-
-double speed
-
-    /speed 0.0
-
-pause
-
-Negative playback is currently rejected with a warning.
-
-`speed` and `playing` are player state, not per-video state, so a speed
-set before a video is loaded applies to whatever loads next.
-
-Audio speed behavior is not currently applicable because the CoreAudio
-backend is not implemented yet.
+    warning: trigger #6: n=9 is past the end of 'media'; event ignored
 
 ---
 
@@ -311,9 +328,9 @@ The current player expects:
 
 - MP4
 - H.264
-- 1920x1080
+- any even resolution up to 3840x2160 (1080p and 1440x1080 both work)
 - progressive
-- fixed frame rate
+- fixed frame rate, 30 fps
 - YUV420P decoder output
 - local SSD
 - normal monotonic timestamps
@@ -324,6 +341,32 @@ The player does not attempt to support arbitrary video formats.
 There is no transcoding pipeline.
 
 Unsupported inputs are rejected rather than silently converted.
+
+### Why 30 fps
+
+Two reasons, and the second is the one that makes the picture look wrong.
+
+The prepared sources are normalized to 30 fps so the picture stays aligned
+with the SuperDirt clock driving the matching WAV. A clip at another rate
+still plays, but it drifts against the audio, which is far more confusing
+than a refusal, so zap warns loudly instead of rejecting it:
+
+    warning: bd.mp4 runs at 25.000 fps, not 30.0 fps: it will drift against
+    the SuperDirt clock. Re-encode it to 30 fps.
+
+The display refresh is the other reason. Presentation is vsync-locked, so
+every source frame is shown for a whole number of display refreshes. On a
+60 Hz display, 30 fps divides evenly: every frame is shown exactly twice,
+and the motion is perfectly even. 25 fps does not divide evenly (2.4
+refreshes per frame), so frames are held for 2 refreshes and then 3 in an
+alternating pattern, which reads as a stutter even when nothing is
+actually dropping. Measured on a 25 fps source: the worker publishes a
+correct 25 fps, the renderer takes a correct 25 fps, and the result still
+judders, because 60 is not a multiple of 25.
+
+Pacing itself is always driven by the stream's own frame timestamps, not by
+a hardcoded frame duration, so a 29.97 (30000/1001) source is accepted and
+plays correctly.
 
 ---
 
@@ -346,13 +389,13 @@ A seek performs:
     stream timestamp
           |
           v
-    avformat_seek_file()
+    avformat_seek_file()      -> keyframe at or BEFORE the target
           |
           v
     avcodec_flush_buffers()
           |
           v
-    decode target frame
+    decode forward, discarding frames, until pts >= target
           |
           v
     frame mailbox
@@ -360,11 +403,37 @@ A seek performs:
           v
     SDL YUV texture
 
-Because the intended source material is GOP=1, there should be no need to
-decode a preceding GOP to reach the target frame.
+The demuxer flag matters. `AVSEEK_FLAG_ANY` lets it return a later
+keyframe, which silently shifts the landing point by up to a full GOP; on a
+30 fps GOP-30 file, `begin=0.25` on a 6 second clip landed at 2.0s instead
+of 1.5s. Since `begin` and `end` are slice boundaries, that error is
+audible as the wrong footage, not just as latency. Seeking backward to the
+containing keyframe and decoding forward lands on the exact frame.
 
-The benchmark is intended to determine whether that assumption actually gives
-the desired latency on the target files.
+The cost of that correctness is decoding the frames between the keyframe and
+the target, so seek latency is proportional to GOP length. On all-I sources
+(GOP=1) it is a single frame, which is why the intended source material is
+GOP=1 / all-I. On a GOP-30 clip the extra cost measured 1.4ms to 14ms.
+
+---
+
+# Pacing
+
+The video worker paces frames against an absolute deadline derived from the
+frame timestamps, not by sleeping a fixed amount after each decode:
+
+    deadline_ns += next_pts - previous_pts
+
+Slewing the deadline and re-syncing on drift keeps a slow decode from
+permanently shifting the timeline. The earlier implementation slept the
+measured frame interval *after* decoding, so decode time was added to every
+frame: the same 25 fps source ran at 19-20 fps with 49-53ms frame periods
+while the decoder was never actually late and the mailbox never dropped a
+frame. With deadline pacing the same file runs at 25.0-25.4 fps with
+39.9-40.1ms periods.
+
+Because the source is 30 fps and the display is 60 Hz, two frames are
+presented per display refresh.
 
 ---
 
@@ -387,7 +456,7 @@ Current implementation:
         decoding
         seeking
 
-Audio is currently only a stub.
+There is no audio thread, because zap does not decode or output audio.
 
 OSC never directly accesses FFmpeg objects.
 
@@ -482,6 +551,17 @@ The renderer uses:
 
 The mailbox avoids allocating a new 1080p buffer for every frame.
 
+Presentation is vsync-locked: `SDL_SetRenderVSync(renderer, 1)`, and the
+main loop has no sleep of its own, because `SDL_RenderPresent` already
+blocks until the next display refresh. Measured on a 30 fps source the loop
+runs at exactly 60 iterations per second, taking a new frame 30 times per
+second.
+
+This is load-bearing, not a nicety. Without it `SDL_RenderPresent` returns
+immediately, the loop runs at ~140 Hz, and the same frame is re-uploaded
+into the streaming texture and presented four or five times per refresh.
+That is what the picture flickers.
+
 The next optimization target is eliminating the CPU copy when using
 VideoToolbox/Metal.
 
@@ -489,30 +569,27 @@ VideoToolbox/Metal.
 
 # Audio
 
-Audio is currently a stub.
+zap has no audio path. It does not decode, mix, or output sound, and it does
+not synchronize video to an audio clock.
 
-The intended architecture is:
+Audio is SuperDirt's job. The intended workflow is a prepared pair per
+sample:
 
-    FFmpeg audio decoder
-          |
-          v
-    small PCM ring buffer
-          |
-          v
-    CoreAudio callback
+    media/bd.mp4      -> zap
+    media/bd.wav      -> SuperDirt
 
-The callback must remain real-time safe.
+A `/play s "bd" ...` event tells SuperDirt to play `bd.wav` and tells zap to
+show the matching slice of `bd.mp4`. Both are driven by the same clock, so
+zap only has to be correct about *which* frames to show and *when* each slice
+starts, not about sample-accurate A/V alignment.
 
-It must not:
+This is why sources are normalized to 30 fps and 48 kHz: the 48 kHz half
+matters to the WAV and to SuperDirt, and zap deliberately ignores the
+container's audio track entirely.
 
-- allocate
-- perform file I/O
-- call FFmpeg demuxing
-- perform expensive locking
-- process OSC
-
-Once implemented, the audio clock should become the primary normal-playback
-clock.
+Keeping audio out of zap removes the hardest real-time constraint from the
+project: a CoreAudio render callback that must never allocate, block, or
+lock. There is no such callback here.
 
 ---
 
@@ -563,20 +640,12 @@ benchmark baseline.
 
 # Future audio milestone
 
-After video seeking is benchmarked:
+None, by design. Audio belongs to SuperDirt.
 
-    MP4
-      |
-      +--> video
-      |
-      +--> audio
-
-Audio will maintain its own decoder and small PCM queue.
-
-Seeking will invalidate both queues and reposition both streams to the same
-media timestamp.
-
-The audio clock will then drive normal video presentation timing.
+If zap ever needs to know where the sound actually is (for example to
+compensate for output latency), the right move is to have SuperDirt send
+that information over OSC rather than to reintroduce a decoder and a
+real-time audio callback.
 
 ---
 

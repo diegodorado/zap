@@ -3,7 +3,6 @@ const std = @import("std");
 const Player = @import("player.zig").Player;
 const OscServer = @import("osc.zig").OscServer;
 const Renderer = @import("render.zig").Renderer;
-const AudioManager = @import("audio.zig").AudioManager;
 const benchmark = @import("benchmark.zig");
 
 const log = std.log.scoped(.main);
@@ -20,6 +19,7 @@ pub fn main(init: std.process.Init) !void {
 
     var benchmark_path: ?[]const u8 = null;
     var initial_path: ?[]const u8 = null;
+    var media_dir: ?[]const u8 = null;
 
     _ = args.next(); // executable name
 
@@ -30,6 +30,14 @@ pub fn main(init: std.process.Init) !void {
                 return error.MissingBenchmarkPath;
             };
             break;
+        }
+
+        if (std.mem.eql(u8, arg, "--media")) {
+            media_dir = args.next() orelse {
+                log.err("--media requires a directory", .{});
+                return error.MissingMediaDir;
+            };
+            continue;
         }
 
         if (initial_path == null) {
@@ -53,10 +61,11 @@ pub fn main(init: std.process.Init) !void {
     var player = Player.init(io, allocator);
     defer player.deinit();
 
-    try player.start();
+    if (media_dir) |dir| {
+        try player.setMediaDir(dir);
+    }
 
-    var audio = try AudioManager.init();
-    defer audio.deinit();
+    try player.start();
 
     var renderer = try Renderer.init();
     defer renderer.deinit();
@@ -84,12 +93,10 @@ pub fn main(init: std.process.Init) !void {
     // -------------------------------------------------------------------------
 
     while (!renderer.pollQuit()) {
+        // No sleep: SDL_RenderPresent blocks until the next display refresh,
+        // so the loop is paced by the display. Sleeping here added latency and
+        // hid the fact that vsync was not doing the pacing.
         try renderer.render(&player);
-
-        // Keep the main loop responsive without imposing a fixed video rate.
-        io.sleep(.fromMilliseconds(1), .awake) catch |err| switch (err) {
-            error.Canceled => {},
-        };
     }
 
     log.info("shutting down", .{});

@@ -3,6 +3,12 @@ const c = @import("c");
 
 const log = std.log.scoped(.video);
 
+/// Prepared sources are encoded at 30 fps so that zap's picture lines up
+/// with the SuperDirt clock driving the matching WAV. 29.97 (30000/1001) is
+/// accepted as the NTSC flavour of 30.
+const expected_fps: f64 = 30.0;
+const fps_tolerance: f64 = 0.1;
+
 pub const FrameMeta = struct {
     pts: i64,
     position_seconds: f64,
@@ -296,8 +302,6 @@ pub const VideoFile = struct {
     duration_ts: i64,
     duration_seconds: f64,
 
-    audio_present: bool,
-
     mailbox: FrameMailbox,
 
     eof: bool = false,
@@ -371,9 +375,15 @@ pub const VideoFile = struct {
         const width: usize = @intCast(codecpar.width);
         const height: usize = @intCast(codecpar.height);
 
-        if (width != 1920 or height != 1080) {
+        // yuv420p needs even dimensions for every plane, and the renderer
+        // letterboxes anything that does not match the logical presentation
+        // size, so only reject what genuinely cannot be decoded.
+        if (width == 0 or height == 0 or
+            (width & 1) != 0 or (height & 1) != 0 or
+            width > 3840 or height > 2160)
+        {
             log.err(
-                "expected 1920x1080, got {d}x{d}",
+                "unsupported resolution: {d}x{d} (want non-zero, even, at most 3840x2160)",
                 .{ width, height },
             );
             return error.UnsupportedResolution;
@@ -445,20 +455,9 @@ pub const VideoFile = struct {
                 );
         }
 
-        var audio_present = false;
-
-        var i: usize = 0;
-        while (i < fmt.*.nb_streams) : (i += 1) {
-            const s = fmt.*.streams[i].*;
-
-            const s_codecpar = s.codecpar orelse continue;
-
-            if (s_codecpar.*.codec_type == c.AVMEDIA_TYPE_AUDIO) {
-                audio_present = true;
-                break;
-            }
-        }
-
+        // Audio is deliberately ignored: sound is driven by SuperDirt over a
+        // matching wav, so the mp4 only has to carry the picture. The demuxer
+        // still holds the audio packets and the decode loop below skips them.
         const owned_path = try allocator.dupe(u8, path);
 
         errdefer allocator.free(owned_path);
@@ -493,8 +492,6 @@ pub const VideoFile = struct {
             .duration_ts = duration_ts,
             .duration_seconds = duration_seconds,
 
-            .audio_present = audio_present,
-
             .mailbox = mailbox,
         };
 
@@ -508,6 +505,15 @@ pub const VideoFile = struct {
                 duration_seconds,
             },
         );
+
+        // Not a hard failure: a wrong rate still plays, it just drifts against
+        // the audio clock, which is far more confusing than a refusal.
+        if (fps > 0 and @abs(fps - expected_fps) > fps_tolerance) {
+            log.warn(
+                "{s} runs at {d:.3} fps, not {d:.1} fps: it will drift against the SuperDirt clock. Re-encode it to 30 fps.",
+                .{ path, fps, expected_fps },
+            );
+        }
 
         return self;
     }
@@ -541,13 +547,16 @@ pub const VideoFile = struct {
 
         const start_ns = std.Io.Clock.now(.awake, self.io).nanoseconds;
 
+        // Seek to the keyframe at or before the target, not to the next one.
+        // With AVSEEK_FLAG_ANY the demuxer happily hands back a later keyframe,
+        // which silently shifts every slice boundary by up to a full GOP.
         const ret = c.avformat_seek_file(
             self.format_ctx,
             @intCast(self.video_stream_index),
             std.math.minInt(i64),
             target,
             std.math.maxInt(i64),
-            c.AVSEEK_FLAG_ANY,
+            0,
         );
 
         if (ret < 0) {
@@ -560,7 +569,14 @@ pub const VideoFile = struct {
 
         self.eof = false;
 
-        const meta = try self.decodeOneFrame();
+        // Decode forward to the target frame. Dropping these frames is the
+        // price of an exact landing point; how many that costs is exactly the
+        // GOP length, which is why all-intra source encodes matter here.
+        const meta = while (true) {
+            const candidate = try self.decodeOneFrame();
+
+            if (candidate.pts >= target) break candidate;
+        };
 
         self.mailbox.publish(self.frame, meta) catch {};
 
