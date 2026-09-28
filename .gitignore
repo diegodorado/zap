@@ -1,0 +1,4 @@
+# Local Pi runtime state
+.atl/
+zig-out/
+.zig-cache/
