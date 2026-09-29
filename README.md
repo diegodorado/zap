@@ -18,7 +18,8 @@ This is intentionally NOT a general-purpose media player.
 - collection-based sample resolution: `s` names a directory, `n` names a
   clip inside it
 - a named clip is opened once and reused by later triggers
-- normalized slice playback (`begin` .. `end`) with the last frame held
+- normalized slice playback (`begin` .. `end`), black when a slice ends
+- the window is black before the first frame, never a placeholder
 - wall-clock `duration` cutoff
 - an event naming a sample that does not exist is dropped without touching
   the picture
@@ -308,9 +309,18 @@ Both are normalized positions in `0..1` mapped onto that clip's stream
 duration. They are not frame numbers.
 
 `end` defaults to `1`, so an event with no `end` plays to the end of the
-clip. Once the slice reaches `end` the last frame is held until the next
-event. There is no auto-loop: a sample plays its slice once and waits,
-because looping on its own would fight the pattern that drives zap.
+clip. Once the slice reaches `end` the window goes **black** and stays there
+until the next event. There is no auto-loop, because looping on its own would
+fight the pattern that drives zap.
+
+A frozen last frame is not held on screen. A still that outlives its sample
+reads as a clip that is still running, which is exactly the wrong thing to
+show between two notes. The same rule covers the window at startup: it is
+black from the moment it opens until a clip is actually playing.
+
+The worker owns the "is there a picture" flag and the render loop only reads
+it. The frame mailbox cannot answer that question, because its last frame is
+still sitting in it either way.
 
 `end` is a position and `duration` is a wall-clock cutoff, so whichever
 arrives first wins.

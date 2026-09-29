@@ -11,6 +11,14 @@ pub const Renderer = struct {
     renderer: *c.SDL_Renderer,
     texture: *c.SDL_Texture,
 
+    /// Whether the texture has ever received a frame. A freshly created
+    /// streaming texture holds uninitialized memory, and drawing that is what
+    /// showed a green window between launch and the first decoded frame. It
+    /// is tracked here so "never draw an unwritten texture" is a property of
+    /// this function alone, instead of something that depends on the worker
+    /// having published a frame first.
+    has_frame: bool = false,
+
     pub fn init() !Renderer {
         if (!c.SDL_Init(c.SDL_INIT_VIDEO)) {
             log.err("SDL_Init failed: {s}", .{c.SDL_GetError()});
@@ -104,23 +112,31 @@ pub const Renderer = struct {
     }
 
     pub fn render(self: *Renderer, player: *Player) !void {
-        if (player.takeLatestFrame()) |frame| {
-            defer player.releaseFrame(frame);
+        // False before the first trigger and after a slice ends: the window is
+        // black then, because there is no picture rather than a stale one.
+        const live = player.showsFrame();
 
-            const ok = c.SDL_UpdateYUVTexture(
-                self.texture,
-                null,
-                frame.y.ptr,
-                frame.luma_pitch,
-                frame.u.ptr,
-                frame.chroma_pitch,
-                frame.v.ptr,
-                frame.chroma_pitch,
-            );
+        if (live) {
+            if (player.takeLatestFrame()) |frame| {
+                defer player.releaseFrame(frame);
 
-            if (!ok) {
-                log.err("SDL_UpdateYUVTexture failed: {s}", .{c.SDL_GetError()});
-                return error.SdlTextureUpdateFailed;
+                const ok = c.SDL_UpdateYUVTexture(
+                    self.texture,
+                    null,
+                    frame.y.ptr,
+                    frame.luma_pitch,
+                    frame.u.ptr,
+                    frame.chroma_pitch,
+                    frame.v.ptr,
+                    frame.chroma_pitch,
+                );
+
+                if (!ok) {
+                    log.err("SDL_UpdateYUVTexture failed: {s}", .{c.SDL_GetError()});
+                    return error.SdlTextureUpdateFailed;
+                }
+
+                self.has_frame = true;
             }
         }
 
@@ -130,9 +146,12 @@ pub const Renderer = struct {
         // undefined backbuffer. On a 30fps source with a 60Hz display that is
         // half of the refreshes, which reads as flicker even though the frame
         // rate is correct. The texture is the durable copy, so redraw it from
-        // the texture and let it hold until the next update. Because the
-        // texture always exists, there is no path that can present an
-        // undefined backbuffer, not even before the first frame arrives.
+        // the texture and let it hold until the next update.
+        //
+        // The texture is only drawn once it holds a real frame, and only while
+        // a clip is playing. Between those points the clear alone stands, which
+        // is what keeps the window black instead of green before the first
+        // decode and instead of a frozen still after a slice ends.
         _ = c.SDL_SetRenderDrawColor(
             self.renderer,
             0,
@@ -143,12 +162,14 @@ pub const Renderer = struct {
 
         _ = c.SDL_RenderClear(self.renderer);
 
-        _ = c.SDL_RenderTexture(
-            self.renderer,
-            self.texture,
-            null,
-            null,
-        );
+        if (live and self.has_frame) {
+            _ = c.SDL_RenderTexture(
+                self.renderer,
+                self.texture,
+                null,
+                null,
+            );
+        }
 
         _ = c.SDL_RenderPresent(self.renderer);
     }

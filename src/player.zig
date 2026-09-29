@@ -55,6 +55,13 @@ pub const Player = struct {
     mutex: std.Io.Mutex = .init,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+    /// Whether a picture should be on screen right now. The render loop runs
+    /// on its own thread and has to know the difference between "waiting for
+    /// the next frame of a playing clip" and "playback is over, show nothing".
+    /// The mailbox cannot answer that: its last frame is still sitting there
+    /// either way. So the worker owns this flag and the renderer only reads it.
+    showing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
     command: CommandState = .{},
 
     current_video: ?usize = null,
@@ -389,6 +396,12 @@ pub const Player = struct {
         return paths[@intCast(n)];
     }
 
+    /// True while a clip is playing. False before the first trigger and after
+    /// a slice ends, which is when the window must go black.
+    pub fn showsFrame(self: *Player) bool {
+        return self.showing.load(.acquire);
+    }
+
     pub fn takeLatestFrame(
         self: *Player,
     ) ?video.FrameHandle {
@@ -556,6 +569,13 @@ pub const Player = struct {
 
                 last_pts = meta.pts;
 
+                // The seek has already published the target frame, so there is
+                // now something real to show. Raising the flag here rather than
+                // at the top of the trigger is what keeps the renderer from
+                // putting a previous clip's last frame on screen while a new
+                // clip is still being opened.
+                self.showing.store(true, .release);
+
                 std.log.info(
                     "trigger #{d} began at {d:.3}s / {d:.3}s, frame_pts={d}, latency={d:.2}ms",
                     .{
@@ -586,9 +606,9 @@ pub const Player = struct {
 
             const meta = v.decodeAndPublish() catch |err| {
                 if (err == error.EndOfStream) {
-                    // Hold the last frame. A sample plays its slice once and
-                    // waits for the next event; looping on its own would fight
-                    // the pattern that drives zap.
+                    // A sample plays its slice once and waits for the next
+                    // event; looping on its own would fight the pattern that
+                    // drives zap. finishSlice takes the picture to black.
                     self.finishSlice(
                         "reached the end of the clip",
                         v.duration_seconds,
@@ -686,6 +706,11 @@ pub const Player = struct {
         if (self.slice_finished) return;
 
         self.slice_finished = true;
+
+        // A sample that has played its slice goes silent, so the picture goes
+        // with it. Holding the last frame would leave a still on screen that
+        // looks like a clip that is still running.
+        self.showing.store(false, .release);
 
         std.log.info(
             "slice finished at {d:.3}s: {s}",
