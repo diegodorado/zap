@@ -209,6 +209,7 @@ pub const OscServer = struct {
         var n: ?f64 = null;
         var delta: ?f64 = null;
         var legato: ?f64 = null;
+        var speed: ?f64 = null;
 
         var i: usize = 0;
         while (i < arg_tags.len) : (i += 2) {
@@ -240,6 +241,8 @@ pub const OscServer = struct {
                         delta = value;
                     } else if (std.mem.eql(u8, key, "legato")) {
                         legato = value;
+                    } else if (std.mem.eql(u8, key, "speed")) {
+                        speed = value;
                     }
                 },
                 'h' => _ = try readI64(packet, pos),
@@ -256,12 +259,36 @@ pub const OscServer = struct {
 
         // `n` is optional: an absent key is the same as 0, which is
         // SuperDirt's own default for it.
+        //
+        // `speed` is likewise optional and defaults to 1. A negative value is
+        // not clamped away: it is what asks for reverse playback, so the only
+        // value rejected here is a non-finite one, which would poison every
+        // pacing calculation downstream.
+        const requested_speed = speed orelse 1.0;
+
+        if (!std.math.isFinite(requested_speed)) {
+            std.log.warn(
+                "speed {d} is not a number; treating this event as speed 1",
+                .{requested_speed},
+            );
+            self.player.requestTrigger(
+                name,
+                begin orelse 0,
+                end orelse 1,
+                n orelse 0,
+                duration,
+                1.0,
+            );
+            return;
+        }
+
         self.player.requestTrigger(
             name,
             begin orelse 0,
             end orelse 1,
             n orelse 0,
             duration,
+            requested_speed,
         );
     }
 };

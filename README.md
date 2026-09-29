@@ -19,6 +19,7 @@ This is intentionally NOT a general-purpose media player.
   clip inside it
 - a named clip is opened once and reused by later triggers
 - normalized slice playback (`begin` .. `end`), black when a slice ends
+- `speed` playback rate, including negative values for reverse playback
 - the window is black before the first frame, never a placeholder
 - wall-clock `duration` cutoff
 - an event naming a sample that does not exist is dropped without touching
@@ -237,6 +238,7 @@ zap reads these keys:
 | `begin`  | `f`   | `0`     | normalized start position                  |
 | `end`    | `f`   | `1`     | normalized end position                    |
 | `n`      | `f`   | `0`     | sample number; only > 0 selects by index   |
+| `speed`  | `f`   | `1`     | playback rate; negative plays backwards    |
 | `delta`  | `f`   | `0`     | event length in seconds                    |
 | `legato` | `f`   | `1`     | length multiplier                          |
 
@@ -253,7 +255,9 @@ it:
 so a video slice lasts exactly as long as the grain it belongs to. A bare
 `/play s "bd"` with no `delta` plays the whole slice.
 
-Sending `/load`, `/seek` or `/speed` does nothing. They are gone.
+Sending `/load`, `/seek` or `/speed` as an **address** does nothing. They are
+gone. That is unrelated to the `speed` *key* on `/play`: playback rate is a
+parameter of the event, not a separate message.
 
 ### Types
 
@@ -324,6 +328,54 @@ still sitting in it either way.
 
 `end` is a position and `duration` is a wall-clock cutoff, so whichever
 arrives first wins.
+
+Under reverse playback `end` has to lie *behind* `begin` to bound anything,
+because that is the direction of travel. An `end` that contradicts the
+direction of `speed` is ignored rather than silently stopping the slice on its
+first frame. So these are the meaningful combinations:
+
+    speed  1   begin 0.50  end 0.60    # forward, 0.50 -> 0.60
+    speed -1   begin 0.50  end 0.40    # reverse, 0.50 -> 0.40
+
+### `speed`
+
+`speed` is the playback rate, defaulting to `1` (the source frame rate). The
+sign carries the direction, and the magnitude scales how fast the timeline
+moves:
+
+    speed  2    twice as fast, every frame still shown
+    speed  0.5  half speed, each frame held for two display refreshes
+    speed -1    reverse, at the normal rate
+    speed -2    reverse, twice as fast
+    speed  0    hold the frame at `begin` and do not move
+
+The rate scales *time*, not the frame step. At `speed 2` the timeline covers
+twice as much content per second, so each frame is on screen half as long and
+no frames are skipped. That is the difference between "plays faster" and
+"plays a longer excerpt at the same speed", and only the first one is what a
+`speed` parameter means.
+
+`speed 0` is degenerate rather than fast. There is no direction to move in, so
+zap holds the frame the event landed on for the length of the slice and warns
+that it did so. It does not divide by it.
+
+**Reverse costs a seek per displayed frame.** `av_read_frame` only walks
+forward, so stepping back cannot be expressed as a decode: every step back is
+a real seek plus an I-frame decode. The all-intra source contract is what makes
+that affordable at all. On a GOP-encoded source each backward step would decode
+forward from the previous keyframe, costing a whole GOP per displayed frame,
+and reverse would be unusable in real time. This is the same reason `begin`
+and `end` need GOP=1, seen from the other direction.
+
+The frame mailbox has to be told which way time is moving before any frame is
+published, because with two frames in flight it has to decide which one is the
+*newer*. Forward, that is the largest timestamp; reverse, it is the smallest.
+Picking by timestamp alone would pin the picture on the first frame of a
+reverse slice.
+
+`speed` is clamped to `±8`. Past that the wall-clock interval per frame drops
+below what one seek and one decode fit inside, and extra rate stops being extra
+motion and starts being dropped frames.
 
 ### `n`
 
@@ -487,7 +539,7 @@ starts one frame before it.
 The video worker paces frames against an absolute deadline derived from the
 frame timestamps, not by sleeping a fixed amount after each decode:
 
-    deadline_ns += next_pts - previous_pts
+    deadline_ns += (next_pts - previous_pts) / speed
 
 Slewing the deadline and re-syncing on drift keeps a slow decode from
 permanently shifting the timeline. The earlier implementation slept the
@@ -496,6 +548,11 @@ frame: the same 25 fps source ran at 19-20 fps with 49-53ms frame periods
 while the decoder was never actually late and the mailbox never dropped a
 frame. With deadline pacing the same file runs at 25.0-25.4 fps with
 39.9-40.1ms periods.
+
+The step is a magnitude, so the same formula paces both directions: the sign
+of `speed` only says which way the mailbox was told time is moving. A
+forward-only test on the step would leave reverse playback unthrottled,
+spinning as fast as the decoder could manage.
 
 Because the source is 30 fps and the display is 60 Hz, two frames are
 presented per display refresh.

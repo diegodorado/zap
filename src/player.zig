@@ -38,6 +38,12 @@ const TriggerState = struct {
     /// the same request, and both mean the first clip of the collection.
     n: i32 = 0,
     duration: f64 = 0,
+
+    /// Playback rate. 1 is the source frame rate, 2 is twice as fast, and a
+    /// negative value plays the clip backwards. Zero is degenerate rather than
+    /// fast: it asks for no movement at all, so the worker holds the frame it
+    /// landed on instead of dividing by it.
+    speed: f64 = 1,
 };
 
 const CommandState = struct {
@@ -77,6 +83,10 @@ pub const Player = struct {
     stop_position_seconds: ?f64 = null,
     stop_at_ns: ?u64 = null,
     slice_finished: bool = false,
+
+    /// Playback rate of the active trigger, with its sign carrying the
+    /// direction. Read by the worker only, written when a trigger is applied.
+    speed: f64 = 1,
 
     /// Root that holds the collections. Required, and fixed for the lifetime
     /// of the process, so it is borrowed from the command line rather than
@@ -154,6 +164,7 @@ pub const Player = struct {
         end: f64,
         n: ?f64,
         duration: f64,
+        speed: f64,
     ) void {
         if (name.len >= MAX_NAME) {
             std.log.warn("s: name too long ({d} bytes); ignored", .{name.len});
@@ -177,10 +188,13 @@ pub const Player = struct {
             break :blk if (index > 0) @as(i32, @intCast(index)) else 0;
         } else 0;
         self.command.trigger.duration = @max(duration, 0);
+        // Only the sign and magnitude matter; the magnitude is clamped so an
+        // absurd rate cannot make the pacing deadline wrap around.
+        self.command.trigger.speed = std.math.clamp(speed, -max_speed, max_speed);
         self.command.trigger.generation += 1;
 
         std.log.info(
-            "TRIGGER #{d} s={s} begin={d:.4} end={d:.4} n={d} duration={d:.3}",
+            "TRIGGER #{d} s={s} begin={d:.4} end={d:.4} n={d} duration={d:.3} speed={d:.3}",
             .{
                 self.command.trigger.generation,
                 if (name.len > 0) name else "",
@@ -188,6 +202,7 @@ pub const Player = struct {
                 self.command.trigger.end,
                 self.command.trigger.n,
                 self.command.trigger.duration,
+                self.command.trigger.speed,
             },
         );
     }
@@ -545,6 +560,8 @@ pub const Player = struct {
                     );
                 }
 
+                self.speed = t.speed;
+
                 const target = self.activeVideo() orelse {
                     std.log.warn(
                         "trigger #{d} ignored: no clip to play",
@@ -553,7 +570,27 @@ pub const Player = struct {
                     continue;
                 };
 
-                if (t.end > t.begin) {
+                const reversing = t.speed < 0;
+
+                // The mailbox has to know which way time is moving before any
+                // frame is published, because it decides which of two pending
+                // frames is the newer one.
+                target.setDirection(if (reversing) .reverse else .forward);
+
+                if (t.speed == 0) {
+                    std.log.warn(
+                        "trigger #{d}: speed 0 asks for no playback; holding the frame at begin={d:.4}",
+                        .{ t.generation, t.begin },
+                    );
+                }
+
+                // `end` only bounds a slice when it lies ahead of `begin` in
+                // the direction of travel. Under reverse, "ahead" is a smaller
+                // timestamp, so requiring end > begin would silently drop the
+                // bound and let the slice run to the start of the clip.
+                const end_is_ahead = if (reversing) t.end < t.begin else t.end > t.begin;
+
+                if (end_is_ahead) {
                     self.stop_position_seconds = t.end * target.duration_seconds;
                 }
 
@@ -577,12 +614,13 @@ pub const Player = struct {
                 self.showing.store(true, .release);
 
                 std.log.info(
-                    "trigger #{d} began at {d:.3}s / {d:.3}s, frame_pts={d}, latency={d:.2}ms",
+                    "trigger #{d} began at {d:.3}s / {d:.3}s, frame_pts={d}, speed={d:.3}, latency={d:.2}ms",
                     .{
                         t.generation,
                         meta.position_seconds,
                         target.duration_seconds,
                         meta.pts,
+                        t.speed,
                         @as(f64, @floatFromInt(util.nowNs(self.io) - start_ns)) /
                             1_000_000.0,
                     },
@@ -604,40 +642,109 @@ pub const Player = struct {
 
             const decode_start = util.nowNs(self.io);
 
-            const meta = v.decodeAndPublish() catch |err| {
-                if (err == error.EndOfStream) {
-                    // A sample plays its slice once and waits for the next
-                    // event; looping on its own would fight the pattern that
-                    // drives zap. finishSlice takes the picture to black.
-                    self.finishSlice(
-                        "reached the end of the clip",
-                        v.duration_seconds,
-                    );
+            // Speed 0 is the one rate that is not a rate. Holding the frame
+            // the trigger seek already published is the only honest reading of
+            // it, and skipping the whole step here also keeps the pacing
+            // division below from dividing by zero. Only `duration` can end
+            // such a slice: the timeline never travels, so an `end` bound is
+            // a position it can never arrive at.
+            if (self.speed == 0) {
+                util.sleepNs(self.io, 1_000_000);
 
-                    continue;
+                if (self.stop_at_ns) |deadline| {
+                    if (util.nowNs(self.io) >= deadline) {
+                        // Report where the picture actually is, not zero, or
+                        // the log claims the slice fell off the front of the
+                        // clip when nothing moved at all.
+                        const held = if (last_pts) |pts|
+                            @as(f64, @floatFromInt(pts)) * c.av_q2d(v.time_base)
+                        else
+                            0;
+
+                        self.finishSlice("reached duration", held);
+                    }
                 }
 
-                std.log.err(
-                    "decode failed: {s}",
-                    .{@errorName(err)},
-                );
-
-                util.sleepNs(self.io, 5_000_000);
                 continue;
+            }
+
+            const reversing = self.speed < 0;
+
+            const stepped = blk: {
+                if (reversing) {
+                    const from_pts = last_pts orelse 0;
+
+                    break :blk v.stepBackward(from_pts) catch |err| {
+                        if (err == error.StartOfClip) {
+                            // Running off the front of the clip ends the slice
+                            // the same way running off the end does: the sample
+                            // has played out, so the picture goes black.
+                            self.finishSlice(
+                                "reached the start of the clip",
+                                0,
+                            );
+
+                            break :blk null;
+                        }
+
+                        std.log.err("reverse step failed: {s}", .{@errorName(err)});
+
+                        util.sleepNs(self.io, 5_000_000);
+
+                        break :blk null;
+                    };
+                }
+
+                break :blk v.decodeAndPublish() catch |err| {
+                    if (err == error.EndOfStream) {
+                        // A sample plays its slice once and waits for the next
+                        // event; looping on its own would fight the pattern
+                        // that drives zap. finishSlice takes the picture to
+                        // black.
+                        self.finishSlice(
+                            "reached the end of the clip",
+                            v.duration_seconds,
+                        );
+
+                        break :blk null;
+                    }
+
+                    std.log.err(
+                        "decode failed: {s}",
+                        .{@errorName(err)},
+                    );
+
+                    util.sleepNs(self.io, 5_000_000);
+
+                    break :blk null;
+                };
             };
+
+            // A null here means the step already ended the slice or backed off
+            // after a failure; both cases have done their logging and cleanup.
+            const meta = stepped orelse continue;
 
             const decode_ns = util.nowNs(self.io) - decode_start;
 
             if (last_pts) |previous_pts| {
-                const delta_pts = meta.pts - previous_pts;
+                // The magnitude is what sets the interval; the sign only says
+                // which way the mailbox was told time is moving. Pacing on the
+                // magnitude is what lets one formula serve both directions,
+                // where a forward-only `delta_pts > 0` test would leave reverse
+                // playback completely unthrottled and spinning as fast as the
+                // decoder can manage.
+                const delta_pts = @abs(meta.pts - previous_pts);
 
                 if (delta_pts > 0) {
                     const delta_seconds =
                         @as(f64, @floatFromInt(delta_pts)) *
                         c.av_q2d(v.time_base);
 
+                    // Wall time per frame is content time divided by the rate.
+                    // At speed 1 that is the source frame interval; at speed 2
+                    // the same content interval is shown in half the time.
                     const interval_ns: u64 = @intFromFloat(
-                        delta_seconds * 1_000_000_000.0,
+                        delta_seconds * 1_000_000_000.0 / @abs(self.speed),
                     );
 
                     // Pace against an absolute deadline instead of sleeping a
@@ -666,9 +773,16 @@ pub const Player = struct {
 
             // The slice ends at whichever of `end` or `duration` arrives
             // first. Both are bounds on this trigger only; the next trigger
-            // clears them.
+            // clears them. The position test has to follow the direction of
+            // travel, because under reverse the position is counting down and
+            // a `>=` test would never fire.
             if (self.stop_position_seconds) |stop_position| {
-                if (meta.position_seconds >= stop_position) {
+                const reached = if (reversing)
+                    meta.position_seconds <= stop_position
+                else
+                    meta.position_seconds >= stop_position;
+
+                if (reached) {
                     self.finishSlice("reached end", meta.position_seconds);
                     continue;
                 }
@@ -801,3 +915,9 @@ fn clampUnit(value: f64) f64 {
     if (std.math.isNan(value)) return 0;
     return std.math.clamp(value, 0, 1);
 }
+
+/// The fastest playback rate accepted. Above 1 the frame interval shrinks in
+/// proportion, so the cap is really a floor on how small a wall-clock interval
+/// can get before one seek and one decode can no longer fit inside it. Past
+/// this, extra speed stops being extra motion and starts being dropped frames.
+const max_speed: f64 = 8;

@@ -83,16 +83,44 @@ fn copyPlane(
     }
 }
 
+pub const PlaybackDirection = enum {
+    forward,
+    reverse,
+
+    /// Which way the timeline is moving, used to decide which of two pending
+    /// frames is the *newest*. Picking the wrong one is not a subtle stutter:
+    /// under reverse it pins the picture on the first frame of the slice.
+    fn later(self: PlaybackDirection, a: i64, b: i64) bool {
+        return switch (self) {
+            .forward => a > b,
+            .reverse => a < b,
+        };
+    }
+};
+
 pub const FrameMailbox = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
 
     slots: [slot_count]FrameSlot,
 
+    /// Set from the active trigger. Read under the mutex.
+    direction: PlaybackDirection = .forward,
+
     mutex: std.Io.Mutex = .init,
 
     /// One slot is being uploaded to the GPU, the other is being decoded into.
     const slot_count = 2;
+
+    /// Point the mailbox at the direction the timeline is about to move, so
+    /// `takeLatest` keeps returning the frame that arrived last in time rather
+    /// than the one with the largest timestamp.
+    pub fn setDirection(self: *FrameMailbox, direction: PlaybackDirection) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        self.direction = direction;
+    }
 
     pub fn init(
         io: std.Io,
@@ -153,7 +181,10 @@ pub const FrameMailbox = struct {
             }
         }
 
-        // If no free slot exists, replace the oldest ready frame.
+        // If no free slot exists, replace the frame that is furthest behind
+        // along the direction of travel. Under reverse playback the furthest
+        // behind is the largest timestamp, so this cannot keep assuming the
+        // smallest one is always the stalest.
         if (selected == null) {
             var oldest: ?*FrameSlot = null;
 
@@ -163,7 +194,7 @@ pub const FrameMailbox = struct {
                 }
 
                 if (oldest == null or
-                    slot.meta.pts < oldest.?.meta.pts)
+                    !self.direction.later(slot.meta.pts, oldest.?.meta.pts))
                 {
                     oldest = slot;
                 }
@@ -198,7 +229,7 @@ pub const FrameMailbox = struct {
             }
 
             if (selected == null or
-                slot.meta.pts > self.slots[selected.?].meta.pts)
+                self.direction.later(slot.meta.pts, self.slots[selected.?].meta.pts))
             {
                 selected = index;
             }
@@ -257,6 +288,13 @@ pub const VideoFile = struct {
     time_base: c.AVRational,
 
     fps: f64,
+
+    /// One frame in stream time_base units. Every frame timestamp is a
+    /// multiple of this, which is what makes both the frame-boundary snap in
+    /// seekToTs and the reverse step in stepBackward exact. Stored rather
+    /// than recomputed because both of those need it per frame, and a
+    /// float round-trip per frame is how boundary math quietly drifts.
+    frame_duration_ts: i64,
 
     duration_ts: i64,
     duration_seconds: f64,
@@ -448,6 +486,20 @@ pub const VideoFile = struct {
 
             .fps = fps,
 
+            // Guarded because a degenerate time_base would otherwise divide by
+            // zero here rather than failing at the boundary arithmetic that
+            // actually needs a usable value. fps is already validated as ~30.
+            .frame_duration_ts = blk: {
+                const num: f64 = @floatFromInt(video_stream.time_base.num);
+                const den: f64 = @floatFromInt(video_stream.time_base.den);
+
+                if (num <= 0 or den <= 0) break :blk 1;
+
+                const ticks: i64 = @intFromFloat(den / (fps * num));
+
+                break :blk if (ticks < 1) 1 else ticks;
+            },
+
             .duration_ts = duration_ts,
             .duration_seconds = duration_seconds,
 
@@ -495,6 +547,17 @@ pub const VideoFile = struct {
             @as(f64, @floatFromInt(duration)) * clamped,
         );
 
+        return self.seekToTs(target);
+    }
+
+    /// Seek to the frame at or after `ts` and publish it.
+    ///
+    /// This is the single seek primitive: the trigger seek converts a
+    /// normalized position into a timestamp and calls this, and reverse
+    /// stepping calls it with the timestamp of the previous frame. Both need
+    /// the identical "land exactly, decode the minimum" behaviour, so keeping
+    /// one implementation is what stops the two paths from drifting apart.
+    fn seekToTs(self: *VideoFile, target: i64) !FrameMeta {
         const start_ns = util.nowNs(self.io);
 
         // The requested position almost never lands on a frame boundary,
@@ -516,10 +579,7 @@ pub const VideoFile = struct {
         // `target` stays as the break condition on purpose: snapping the
         // comparison too would make a seek near the end of the stream ask for
         // a frame that does not exist and fail with EndOfStream.
-        const frame_duration: i64 = @intFromFloat(
-            @as(f64, @floatFromInt(self.time_base.den)) /
-                (self.fps * @as(f64, @floatFromInt(self.time_base.num))),
-        );
+        const frame_duration = self.frame_duration_ts;
 
         const seek_to = if (frame_duration > 1)
             @divTrunc(target + frame_duration - 1, frame_duration) * frame_duration
@@ -560,9 +620,9 @@ pub const VideoFile = struct {
         self.mailbox.publish(self.frame, meta) catch {};
 
         log.debug(
-            "seek {d:.4} -> {d:.3}s in {d:.2}ms",
+            "seek ts={d} -> {d:.3}s in {d:.2}ms",
             .{
-                clamped,
+                target,
                 meta.position_seconds,
                 @as(f64, @floatFromInt(util.nowNs(self.io) - start_ns)) /
                     1_000_000.0,
@@ -668,6 +728,28 @@ pub const VideoFile = struct {
         );
 
         return meta;
+    }
+
+    pub fn setDirection(self: *VideoFile, direction: PlaybackDirection) void {
+        self.mailbox.setDirection(direction);
+    }
+
+    /// Step one frame back from `from_pts` and publish it.
+    ///
+    /// `av_read_frame` only walks forward, so reverse playback cannot be
+    /// expressed as a decode; every step back is a real seek. That is
+    /// affordable precisely because of the all-intra source contract: one
+    /// seek plus one I-frame decode, with no GOP to walk. On a GOP-encoded
+    /// source each step would decode from the previous keyframe, so reverse
+    /// would cost a whole GOP per displayed frame.
+    pub fn stepBackward(self: *VideoFile, from_pts: i64) !FrameMeta {
+        const target = from_pts - self.frame_duration_ts;
+
+        if (target < 0) {
+            return error.StartOfClip;
+        }
+
+        return self.seekToTs(target);
     }
 
     pub fn takeLatestFrame(self: *VideoFile) ?FrameHandle {
