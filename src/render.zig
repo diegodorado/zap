@@ -118,33 +118,42 @@ pub const Renderer = struct {
     }
 
     pub fn render(self: *Renderer, player: *Player) !void {
-        const frame = player.takeLatestFrame() orelse {
-            // Still present the existing frame/window.
+        if (player.takeLatestFrame()) |frame| {
+            defer player.releaseFrame(frame);
+
+            try self.ensureTexture(frame.width, frame.height);
+
+            const texture = self.texture orelse return error.NoTexture;
+
+            const ok = c.SDL_UpdateYUVTexture(
+                texture,
+                null,
+                frame.y.ptr,
+                frame.y_pitch,
+                frame.u.ptr,
+                frame.u_pitch,
+                frame.v.ptr,
+                frame.v_pitch,
+            );
+
+            if (!ok) {
+                log.err("SDL_UpdateYUVTexture failed: {s}", .{c.SDL_GetError()});
+                return error.SdlTextureUpdateFailed;
+            }
+        }
+
+        // The draw happens on every refresh, not only when a new frame
+        // arrived. SDL does not preserve the render target across
+        // SDL_RenderPresent, so presenting without redrawing shows an
+        // undefined backbuffer. On a 30fps source with a 60Hz display that is
+        // half of the refreshes, which reads as flicker even though the frame
+        // rate is correct. The texture is the durable copy, so redraw it from
+        // the texture and let it hold until the next update.
+        const texture = self.texture orelse {
+            // Nothing decoded yet: nothing to draw.
             _ = c.SDL_RenderPresent(self.renderer);
             return;
         };
-
-        defer player.releaseFrame(frame);
-
-        try self.ensureTexture(frame.width, frame.height);
-
-        const texture = self.texture orelse return error.NoTexture;
-
-        const ok = c.SDL_UpdateYUVTexture(
-            texture,
-            null,
-            frame.y.ptr,
-            frame.y_pitch,
-            frame.u.ptr,
-            frame.u_pitch,
-            frame.v.ptr,
-            frame.v_pitch,
-        );
-
-        if (!ok) {
-            log.err("SDL_UpdateYUVTexture failed: {s}", .{c.SDL_GetError()});
-            return error.SdlTextureUpdateFailed;
-        }
 
         _ = c.SDL_SetRenderDrawColor(
             self.renderer,
@@ -157,12 +166,14 @@ pub const Renderer = struct {
         _ = c.SDL_RenderClear(self.renderer);
 
         // Logical presentation is 1920x1080, so the whole texture can
-        // be rendered into the logical coordinate system.
+        // be rendered into the logical coordinate system. The cached texture
+        // size is used rather than the frame's, because the frame handle is
+        // only available on the update path.
         const dst = c.SDL_FRect{
             .x = 0,
             .y = 0,
-            .w = @floatFromInt(frame.width),
-            .h = @floatFromInt(frame.height),
+            .w = @floatFromInt(self.texture_width),
+            .h = @floatFromInt(self.texture_height),
         };
 
         _ = c.SDL_RenderTexture(

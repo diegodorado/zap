@@ -562,6 +562,14 @@ immediately, the loop runs at ~140 Hz, and the same frame is re-uploaded
 into the streaming texture and presented four or five times per refresh.
 That is what the picture flickers.
 
+The draw runs on **every** refresh, not only when a new frame has been
+decoded. SDL does not preserve the render target across `SDL_RenderPresent`,
+so presenting without redrawing shows an undefined backbuffer. On a 30 fps
+source with a 60 Hz display that is half of all refreshes, which flickers at
+30 Hz even though the frame rate is correct. The texture is the durable copy,
+so the texture is redrawn on every refresh and the upload stays on the
+update path.
+
 The next optimization target is eliminating the CPU copy when using
 VideoToolbox/Metal.
 
