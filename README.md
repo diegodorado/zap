@@ -191,7 +191,7 @@ If an event cannot take effect, the player says so at `warning` level, which
 is visible in every build mode:
 
     warning: trigger #7: no collection "bd" in 'my-media'; event ignored
-    warning: trigger #6: n=9 is past the end of collection "bd" (2 clips); event ignored
+    warning: trigger #6: n=9 with no s; an index only means something inside a collection; event ignored
 
 A quiet log after a command means the packet never arrived. Check that the
 sender targets UDP 9000 on the same host.
@@ -317,10 +317,10 @@ clip. Once the slice reaches `end` the window goes **black** and stays there
 until the next event. There is no auto-loop, because looping on its own would
 fight the pattern that drives zap.
 
-A frozen last frame is not held on screen. A still that outlives its sample
-reads as a clip that is still running, which is exactly the wrong thing to
-show between two notes. The same rule covers the window at startup: it is
-black from the moment it opens until a clip is actually playing.
+A frozen last frame is not held on screen indefinitely. A still that outlives
+its sample by a long stretch reads as a clip that is still running, which is
+exactly the wrong thing to show between two notes. A short grace period is
+different: see below.
 
 The worker owns the "is there a picture" flag and the render loop only reads
 it. The frame mailbox cannot answer that question, because its last frame is
@@ -329,13 +329,53 @@ still sitting in it either way.
 `end` is a position and `duration` is a wall-clock cutoff, so whichever
 arrives first wins.
 
-Under reverse playback `end` has to lie *behind* `begin` to bound anything,
-because that is the direction of travel. An `end` that contradicts the
-direction of `speed` is ignored rather than silently stopping the slice on its
-first frame. So these are the meaningful combinations:
+#### The blackout grace period
+
+When a slice ends, zap holds the last frame for **150 ms** before going black,
+and any event arriving inside that window cancels the blackout. This exists
+because an event always costs a seek: `begin` is a normalized position and
+`begin`/`end` are only frame-exact when the source is all-intra (GOP=1), so a
+larger seek means more decode time before the first frame of the new slice
+reaches the window.
+
+Without the grace, a dense pattern blacked out once per event, because the
+slice finished, the window went black, and then the next event's seek took
+long enough to miss the next display refresh. Measured over a 30-event pattern
+with 5-15 ms seeks, the pre-fix build presented **12 black frames**; with the
+grace it presents none, and the only blackout left is the final one after the
+pattern actually stops.
+
+So the rule reads: a clip that ends and is followed by more events never
+blanks, and a clip that ends because the performance ended does. The window is
+black at startup, before any clip has played.
+
+#### Reverse playback and `begin` / `end`
+
+`speed` is negative, and `begin` is still where playback *starts*, so `end`
+still has to be on the far side of the clip from it. Under reverse that means
+`end < begin`, which is the same shape a forward event has:
 
     speed  1   begin 0.50  end 0.60    # forward, 0.50 -> 0.60
-    speed -1   begin 0.50  end 0.40    # reverse, 0.50 -> 0.40
+    speed -1   begin 0.50  end 0.40    # reverse, 0.60 -> 0.50
+
+zap swaps `begin` and `end` internally when `speed` is negative, so the slice
+still runs from `begin` down to `end` and `end` is still the bound. The
+ordering on the wire is the one SuperDirt expects, and it is worth being
+precise about where that comes from, because getting it wrong is what makes
+reverse look broken rather than merely wrong:
+
+`DirtEvent.orderTimeSpan` in SuperDirt does the same swap. So a real
+SuperDirt/Tidal event carries `begin < end` even at `speed -1`, and zap has to
+read it that way to stay in step with the audio. Sentences that only ever
+arrive with `begin > end` are outside that contract.
+
+One consequence is the default `begin 0, end 1` at `speed -1`: it is a
+whole-clip reverse starting at the last frame. The last frame begins one frame
+interval *before* the stream duration, so `1.0` is not a position a frame
+occupies; seeking to it would ask for the first frame at or after the end of
+the stream, find none, and fail with `EndOfStream`. zap clamps the normalized
+seek to the final frame's timestamp instead, which is why the default reverse
+case works at all.
 
 ### `speed`
 
@@ -400,11 +440,24 @@ makes a bare retrigger re-slice whatever is playing:
     warning: trigger #6: n=9 with no s; an index only means something inside a collection; event ignored
 
 Indices are sorted by filename, so they are stable as long as the file set
-is. An index past the end of its collection is refused, never clamped,
-because silently playing the last clip would look like a working event
-while showing the wrong one:
+is.
 
-    warning: trigger #6: n=9 is past the end of collection "my-sample-y" (2 clips); event ignored
+`n` wraps. It is a signed value and the index is taken modulo the number of
+clips, so `n 100` in a 27-clip collection is clip 19, `n 27` is clip 0, and
+`n -1` is the last clip:
+
+    /play s "s" s "my-sample-y" s "n" f -1   # the last clip in the collection
+
+The reason to wrap rather than refuse is that a collection's length is not
+something the sender can know without reading the directory, and a live
+pattern that indexes past the end is a normal consequence of that. Refusing
+would drop those events outright. Clamping to the last clip would be worse
+than wrapping: it is a silent substitution, so the event looks like it fired
+while showing something the pattern never asked for. Wrapping at least keeps
+every event visible and lets the wrap be audible against the SuperDirt voice.
+
+`n 0` is not a wrap of the collection; it is the default and means "the first
+clip", so a bare event with no `n` is unchanged.
 
 ---
 

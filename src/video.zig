@@ -543,11 +543,24 @@ pub const VideoFile = struct {
             return error.UnknownDuration;
         }
 
+        // The last frame begins one frame interval before the stream duration,
+        // so a normalized 1.0 is a position that has no frame at it. Left
+        // unclamped it asks for the first frame at or after the end of the
+        // stream, and since none exists the decode loop runs off the end and
+        // the seek fails with EndOfStream. That is reachable from a real
+        // trigger: a negative speed swaps begin and end, so the default
+        // begin 0 / end 1 arrives here as a start position of exactly 1.0 and
+        // the whole-clip reverse case would fail on every event.
+        const last_frame = if (self.frame_duration_ts > 0)
+            duration - self.frame_duration_ts
+        else
+            duration;
+
         const target: i64 = @intFromFloat(
             @as(f64, @floatFromInt(duration)) * clamped,
         );
 
-        return self.seekToTs(target);
+        return self.seekToTs(@min(target, last_frame));
     }
 
     /// Seek to the frame at or after `ts` and publish it.

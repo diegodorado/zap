@@ -36,6 +36,8 @@ const TriggerState = struct {
     /// SuperDirt sends 0 on every event as its default, so 0 meaning "the
     /// first clip" is not a collision: an absent `n` and an explicit `n 0` are
     /// the same request, and both mean the first clip of the collection.
+    /// The value wraps against the collection size, so a pattern may index
+    /// past the end or below zero without the event being dropped.
     n: i32 = 0,
     duration: f64 = 0,
 
@@ -87,6 +89,19 @@ pub const Player = struct {
     /// Playback rate of the active trigger, with its sign carrying the
     /// direction. Read by the worker only, written when a trigger is applied.
     speed: f64 = 1,
+
+    /// When a finished slice should actually go black, or null when no
+    /// blackout is pending.
+    ///
+    /// A pattern retriggers back to back, so the moment a slice reaches its
+    /// `end` or `duration` bound the next event is usually already on its way.
+    /// Going black right then drops the picture for exactly that gap, and the
+    /// gap is a few milliseconds wide and lands mid display refresh often
+    /// enough to read as a flicker on every single event. The picture
+    /// therefore holds its last frame instead, a new trigger cancels the
+    /// pending blackout, and only a pattern that genuinely stops ever reaches
+    /// it.
+    blackout_at_ns: ?u64 = null,
 
     /// Root that holds the collections. Required, and fixed for the lifetime
     /// of the process, so it is borrowed from the command line rather than
@@ -182,10 +197,23 @@ pub const Player = struct {
         self.command.trigger.begin = clampUnit(begin);
         self.command.trigger.end = clampUnit(end);
         // `n` is optional and defaults to 0, so an absent `n` and an explicit
-        // `n 0` are the same request.
+        // `n 0` are the same request. The sign is kept because `n` wraps: a
+        // negative index counts back from the last clip, and collapsing it to
+        // 0 here would make every negative `n` play the first clip instead.
         self.command.trigger.n = if (n) |value| blk: {
-            const index = @as(i64, @intFromFloat(@round(value)));
-            break :blk if (index > 0) @as(i32, @intCast(index)) else 0;
+            if (!std.math.isFinite(value)) break :blk 0;
+
+            // Clamped rather than wrapped so the narrowing cast below cannot
+            // trap on a wildly out of range value. The modulo that actually
+            // chooses a clip happens in resolveSample, which is where the
+            // collection length is known.
+            const wide: i64 = @intFromFloat(@round(value));
+
+            break :blk @as(i32, @intCast(std.math.clamp(
+                wide,
+                -max_n,
+                max_n,
+            )));
         } else 0;
         self.command.trigger.duration = @max(duration, 0);
         // Only the sign and magnitude matter; the magnitude is clamped so an
@@ -390,11 +418,9 @@ pub const Player = struct {
             // `n` alone cannot address anything: an index is only meaningful
             // relative to a collection. A plain retrigger carries neither and
             // keeps the current clip.
-            if (n > 0) return error.IndexWithoutCollection;
+            if (n != 0) return error.IndexWithoutCollection;
             return null;
         }
-
-        if (n < 0) return error.IndexOutOfRange;
 
         const paths = self.collections.get(name) orelse {
             return error.SampleNotFound;
@@ -402,13 +428,16 @@ pub const Player = struct {
 
         if (paths.len == 0) return error.CollectionEmpty;
 
-        // Out of range is an error, never a clamp: silently playing the last
-        // clip would look like a working trigger while showing the wrong one.
-        if (@as(usize, @intCast(n)) >= paths.len) {
-            return error.IndexOutOfRange;
-        }
+        // `n` wraps instead of failing. A pattern walking off the end of the
+        // collection keeps playing, which is what indexing a fixed set of
+        // clips means, and an error here would silently drop the event and
+        // leave a hole in the middle of a performance. Modulo on a
+        // nonnegative `n` also keeps "0 is the first clip" true, because
+        // 0 % len is 0, and a negative `n` counts back from the last clip.
+        const count: i32 = @intCast(paths.len);
+        const index: i32 = @mod(n, count);
 
-        return paths[@intCast(n)];
+        return paths[@intCast(index)];
     }
 
     /// True while a clip is playing. False before the first trigger and after
@@ -519,15 +548,6 @@ pub const Player = struct {
                                 "trigger #{d}: collection \"{s}\" has no clips; event ignored",
                                 .{ t.generation, name },
                             ),
-                            error.IndexOutOfRange => std.log.warn(
-                                "trigger #{d}: n={d} is past the end of collection \"{s}\" ({d} clips); event ignored",
-                                .{
-                                    t.generation,
-                                    t.n,
-                                    name,
-                                    self.collections.get(name).?.len,
-                                },
-                            ),
                             error.IndexWithoutCollection => std.log.warn(
                                 "trigger #{d}: n={d} with no s; an index only means something inside a collection; event ignored",
                                 .{ t.generation, t.n },
@@ -545,8 +565,11 @@ pub const Player = struct {
                     }
                 }
 
-                // A new event always resumes playback and restarts pacing.
+                // A new event always resumes playback and restarts pacing, and
+                // it cancels a blackout the previous slice had scheduled: two
+                // adjacent events must never put a black frame between them.
                 self.slice_finished = false;
+                self.blackout_at_ns = null;
                 last_pts = null;
                 deadline_ns = 0;
 
@@ -572,6 +595,29 @@ pub const Player = struct {
 
                 const reversing = t.speed < 0;
 
+                // A negative speed swaps the two ends, exactly as SuperDirt
+                // does in `DirtEvent.orderTimeSpan`:
+                //
+                //     if(~speed < 0) { temp = ~end; ~end = ~begin; ~begin = temp }
+                //
+                // A pattern therefore always describes a slice as begin < end
+                // and lets the sign of speed say which way it is read. Reading
+                // the pair literally instead is what made every reverse slice
+                // wrong in two separate ways: with the default begin 0 / end 1
+                // it seeked to 0 and then ran off the front of the clip on the
+                // first step, which is a black screen; and with a real pair
+                // like begin 0.5 end 0.75, `end` sits ahead in the direction of
+                // travel, so the bound was silently dropped and the slice ran
+                // all the way back to the start of the clip.
+                var begin = t.begin;
+                var end = t.end;
+
+                if (reversing) {
+                    const first = begin;
+                    begin = end;
+                    end = first;
+                }
+
                 // The mailbox has to know which way time is moving before any
                 // frame is published, because it decides which of two pending
                 // frames is the newer one.
@@ -580,26 +626,24 @@ pub const Player = struct {
                 if (t.speed == 0) {
                     std.log.warn(
                         "trigger #{d}: speed 0 asks for no playback; holding the frame at begin={d:.4}",
-                        .{ t.generation, t.begin },
+                        .{ t.generation, begin },
                     );
                 }
 
-                // `end` only bounds a slice when it lies ahead of `begin` in
-                // the direction of travel. Under reverse, "ahead" is a smaller
-                // timestamp, so requiring end > begin would silently drop the
-                // bound and let the slice run to the start of the clip.
-                const end_is_ahead = if (reversing) t.end < t.begin else t.end > t.begin;
-
-                if (end_is_ahead) {
-                    self.stop_position_seconds = t.end * target.duration_seconds;
+                // After the swap `end` is the far end in the direction of
+                // travel, so one test serves both directions. A slice whose
+                // `end` is behind its `begin` has no far end: it is bound only
+                // by `duration`, and runs to the start of the clip.
+                if (end > begin) {
+                    self.stop_position_seconds = end * target.duration_seconds;
                 }
 
                 const start_ns = util.nowNs(self.io);
 
-                const meta = target.seekNormalized(t.begin) catch |err| {
+                const meta = target.seekNormalized(begin) catch |err| {
                     std.log.err(
                         "trigger #{d}: seek to {d:.4} failed: {s}",
-                        .{ t.generation, t.begin, @errorName(err) },
+                        .{ t.generation, begin, @errorName(err) },
                     );
                     continue;
                 };
@@ -636,6 +680,15 @@ pub const Player = struct {
             };
 
             if (self.slice_finished) {
+                // The grace period is up and no new event claimed the window,
+                // so the slice really is over: now, and only now, black.
+                if (self.blackout_at_ns) |at| {
+                    if (util.nowNs(self.io) >= at) {
+                        self.showing.store(false, .release);
+                        self.blackout_at_ns = null;
+                    }
+                }
+
                 util.sleepNs(self.io, 1_000_000);
                 continue;
             }
@@ -821,10 +874,13 @@ pub const Player = struct {
 
         self.slice_finished = true;
 
-        // A sample that has played its slice goes silent, so the picture goes
-        // with it. Holding the last frame would leave a still on screen that
-        // looks like a clip that is still running.
-        self.showing.store(false, .release);
+        // The picture does NOT go black here. A sample that has played its
+        // slice goes silent, but the next event is normally already on its
+        // way, and cutting to black for the gap between them is a black flash
+        // on every event. So the frame holds and the blackout is scheduled
+        // instead: a new trigger cancels it, and only a pattern that has
+        // really stopped ever gets a black window.
+        self.blackout_at_ns = util.nowNs(self.io) + blackout_grace_ns;
 
         std.log.info(
             "slice finished at {d:.3}s: {s}",
@@ -921,3 +977,20 @@ fn clampUnit(value: f64) f64 {
 /// can get before one seek and one decode can no longer fit inside it. Past
 /// this, extra speed stops being extra motion and starts being dropped frames.
 const max_speed: f64 = 8;
+
+/// How long a finished slice keeps showing its last frame before the window
+/// goes black.
+///
+/// This is the gap a pattern is given to deliver its next event before the
+/// picture is declared over. It has to cover the inter-onset interval of a
+/// dense pattern, because anything arriving inside it must find a live window
+/// to draw into, or every event boundary becomes a black flash. 150 ms is
+/// about a sixteenth note at 160 BPM, so ordinary fast material retriggers
+/// well inside it, while a pattern that has actually stopped still goes black
+/// promptly instead of leaving a still on screen.
+const blackout_grace_ns: u64 = 150 * 1_000_000;
+
+/// Widest `n` accepted from the wire, so an absurd index cannot trap the cast.
+/// It is far past any real collection length; the modulo in resolveSample is
+/// what actually maps it onto a clip.
+const max_n: i64 = std.math.maxInt(i32);
