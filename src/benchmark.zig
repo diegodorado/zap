@@ -1,4 +1,5 @@
 const std = @import("std");
+const util = @import("util.zig");
 const video = @import("video.zig");
 
 pub fn run(
@@ -56,7 +57,7 @@ pub fn run(
             (@as(f64, @floatFromInt(nextRandom(&rng_state))) /
                 @as(f64, @floatFromInt(std.math.maxInt(u64))));
 
-        const start_ns = std.Io.Clock.now(.awake, io).nanoseconds;
+        const start_ns = util.nowNs(io);
 
         _ = v.seekNormalized(position) catch |err| {
             if (err == error.EndOfStream) {
@@ -67,9 +68,7 @@ pub fn run(
             return err;
         };
 
-        samples[recorded] = @intCast(
-            std.Io.Clock.now(.awake, io).nanoseconds - start_ns,
-        );
+        samples[recorded] = util.nowNs(io) - start_ns;
 
         recorded += 1;
 

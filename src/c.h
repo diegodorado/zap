@@ -13,7 +13,6 @@
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
 #include <libavutil/error.h>
-#include <libavutil/imgutils.h>
 
 /*
  * POSIX / BSD sockets for OSC.

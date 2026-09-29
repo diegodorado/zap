@@ -76,12 +76,6 @@ pub fn build(b: *std.Build) void {
     exe.root_module.linkSystemLibrary("avformat", .{});
     exe.root_module.linkSystemLibrary("avcodec", .{});
     exe.root_module.linkSystemLibrary("avutil", .{});
-    exe.root_module.linkSystemLibrary("swscale", .{});
-
-    // macOS frameworks.
-    exe.root_module.linkFramework("CoreAudio", .{});
-    exe.root_module.linkFramework("VideoToolbox", .{});
-    exe.root_module.linkFramework("Foundation", .{});
 
     b.installArtifact(exe);
 

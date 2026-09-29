@@ -9,10 +9,7 @@ const log = std.log.scoped(.render);
 pub const Renderer = struct {
     window: *c.SDL_Window,
     renderer: *c.SDL_Renderer,
-    texture: ?*c.SDL_Texture = null,
-
-    texture_width: i32 = 0,
-    texture_height: i32 = 0,
+    texture: *c.SDL_Texture,
 
     pub fn init() !Renderer {
         if (!c.SDL_Init(c.SDL_INIT_VIDEO)) {
@@ -57,83 +54,68 @@ pub const Renderer = struct {
             log.warn("vsync is off; presentation is not frame-locked", .{});
         }
 
-        // Fixed source resolution, preserving aspect ratio.
-        _ = c.SDL_SetRenderLogicalPresentation(
+        // Fixed logical size, so a resized window letterboxes instead of
+        // stretching. The window is resizable and the default 1280x720 is
+        // already 16:9, but dragging the window to any other shape must not
+        // distort the picture, so the scale factor is SDL's job, not a dst
+        // rect recomputed from the source on every clip change.
+        if (!c.SDL_SetRenderLogicalPresentation(
             renderer,
-            1920,
-            1080,
+            video.frame_width,
+            video.frame_height,
             c.SDL_LOGICAL_PRESENTATION_LETTERBOX,
-        );
+        )) {
+            log.warn(
+                "could not set logical presentation: {s}; resizing the " ++
+                    "window will stretch the picture",
+                .{c.SDL_GetError()},
+            );
+        }
+
+        // Every source is 1920x1080, so the texture is allocated once at
+        // startup and never resized. With logical presentation handling the
+        // window fit, a null source rect and a null destination rect are
+        // correct and there is no per-frame rect math left to get wrong.
+        const texture = c.SDL_CreateTexture(
+            renderer,
+            c.SDL_PIXELFORMAT_IYUV,
+            c.SDL_TEXTUREACCESS_STREAMING,
+            @intCast(video.frame_width),
+            @intCast(video.frame_height),
+        ) orelse {
+            log.err("SDL_CreateTexture failed: {s}", .{c.SDL_GetError()});
+            return error.SdlTextureFailed;
+        };
 
         log.info("SDL renderer initialized", .{});
 
         return .{
             .window = window,
             .renderer = renderer,
+            .texture = texture,
         };
     }
 
     pub fn deinit(self: *Renderer) void {
-        if (self.texture) |texture| {
-            c.SDL_DestroyTexture(texture);
-            self.texture = null;
-        }
-
+        c.SDL_DestroyTexture(self.texture);
         c.SDL_DestroyRenderer(self.renderer);
         c.SDL_DestroyWindow(self.window);
         c.SDL_Quit();
-    }
-
-    fn ensureTexture(
-        self: *Renderer,
-        width: i32,
-        height: i32,
-    ) !void {
-        if (self.texture != null and
-            self.texture_width == width and
-            self.texture_height == height)
-        {
-            return;
-        }
-
-        if (self.texture) |texture| {
-            c.SDL_DestroyTexture(texture);
-            self.texture = null;
-        }
-
-        const texture = c.SDL_CreateTexture(
-            self.renderer,
-            c.SDL_PIXELFORMAT_IYUV,
-            c.SDL_TEXTUREACCESS_STREAMING,
-            width,
-            height,
-        ) orelse {
-            log.err("SDL_CreateTexture failed: {s}", .{c.SDL_GetError()});
-            return error.SdlTextureFailed;
-        };
-
-        self.texture = texture;
-        self.texture_width = width;
-        self.texture_height = height;
     }
 
     pub fn render(self: *Renderer, player: *Player) !void {
         if (player.takeLatestFrame()) |frame| {
             defer player.releaseFrame(frame);
 
-            try self.ensureTexture(frame.width, frame.height);
-
-            const texture = self.texture orelse return error.NoTexture;
-
             const ok = c.SDL_UpdateYUVTexture(
-                texture,
+                self.texture,
                 null,
                 frame.y.ptr,
-                frame.y_pitch,
+                frame.luma_pitch,
                 frame.u.ptr,
-                frame.u_pitch,
+                frame.chroma_pitch,
                 frame.v.ptr,
-                frame.v_pitch,
+                frame.chroma_pitch,
             );
 
             if (!ok) {
@@ -148,13 +130,9 @@ pub const Renderer = struct {
         // undefined backbuffer. On a 30fps source with a 60Hz display that is
         // half of the refreshes, which reads as flicker even though the frame
         // rate is correct. The texture is the durable copy, so redraw it from
-        // the texture and let it hold until the next update.
-        const texture = self.texture orelse {
-            // Nothing decoded yet: nothing to draw.
-            _ = c.SDL_RenderPresent(self.renderer);
-            return;
-        };
-
+        // the texture and let it hold until the next update. Because the
+        // texture always exists, there is no path that can present an
+        // undefined backbuffer, not even before the first frame arrives.
         _ = c.SDL_SetRenderDrawColor(
             self.renderer,
             0,
@@ -165,22 +143,11 @@ pub const Renderer = struct {
 
         _ = c.SDL_RenderClear(self.renderer);
 
-        // Logical presentation is 1920x1080, so the whole texture can
-        // be rendered into the logical coordinate system. The cached texture
-        // size is used rather than the frame's, because the frame handle is
-        // only available on the update path.
-        const dst = c.SDL_FRect{
-            .x = 0,
-            .y = 0,
-            .w = @floatFromInt(self.texture_width),
-            .h = @floatFromInt(self.texture_height),
-        };
-
         _ = c.SDL_RenderTexture(
             self.renderer,
-            texture,
+            self.texture,
             null,
-            &dst,
+            null,
         );
 
         _ = c.SDL_RenderPresent(self.renderer);

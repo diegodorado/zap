@@ -1,4 +1,7 @@
 const std = @import("std");
+const c = @import("c");
+
+const util = @import("util.zig");
 const video = @import("video.zig");
 
 const Allocator = std.mem.Allocator;
@@ -10,18 +13,6 @@ pub const MAX_NAME = 256;
 
 const default_media_dir = "media";
 const sample_extension = ".mp4";
-
-pub const PlayerState = struct {
-    current_video: ?usize = null,
-
-    duration: f64 = 0,
-    position: f64 = 0,
-
-    fps: f64 = 0,
-
-    video_width: usize = 0,
-    video_height: usize = 0,
-};
 
 /// One OSC event, in SuperDirt shape.
 ///
@@ -67,7 +58,7 @@ pub const Player = struct {
 
     command: CommandState = .{},
 
-    state: PlayerState = .{},
+    current_video: ?usize = null,
 
     videos: [MAX_VIDEOS]?*video.VideoFile = @splat(null),
 
@@ -86,6 +77,12 @@ pub const Player = struct {
     media_dir: []const u8 = default_media_dir,
     owned_media_dir: ?[]u8 = null,
 
+    /// Sorted "<media_dir>/<clip>" paths for every clip in the media
+    /// directory, built on first use and kept. A pattern fires many events a
+    /// second, and rescanning and re-sorting the directory per event is real
+    /// work to produce an answer that cannot have changed.
+    listing: ?[][]u8 = null,
+
     pub fn init(io: std.Io, allocator: Allocator) Player {
         return .{
             .io = io,
@@ -101,6 +98,8 @@ pub const Player = struct {
             self.allocator.free(owned);
             self.owned_media_dir = null;
         }
+
+        self.clearListing();
 
         if (std.mem.eql(u8, dir, default_media_dir)) {
             self.media_dir = default_media_dir;
@@ -140,6 +139,8 @@ pub const Player = struct {
                 entry.* = null;
             }
         }
+
+        self.clearListing();
 
         if (self.owned_media_dir) |owned| {
             self.allocator.free(owned);
@@ -196,21 +197,37 @@ pub const Player = struct {
         );
     }
 
-    /// Resolve a SuperDirt-style sample name to a file on disk.
-    ///
-    /// A name that looks like a path is used as-is, which keeps CLI and patch
-    /// usage working. Otherwise the media directory is searched for clips whose
-    /// basename matches, and `n` picks among the matches in sorted order, the
-    /// same way `n` picks among samples sharing a name in SuperDirt.
-    /// Copies the file name of the `n`-th `.mp4` in the media directory, in
-    /// sorted order, into `buffer`. `n` is an absolute index into that
-    /// listing, not a variant of a named sample.
-    fn resolveIndex(
+    /// Write "<media_dir>/<name>" into `buffer` and return it.
+    fn joinMediaDir(
         self: *Player,
-        n: i32,
         buffer: []u8,
+        name: []const u8,
     ) ![]const u8 {
-        if (n < 0) return error.IndexOutOfRange;
+        const dir_len = self.media_dir.len;
+
+        if (dir_len + 1 + name.len > buffer.len) {
+            return error.NameTooLong;
+        }
+
+        @memcpy(buffer[0..dir_len], self.media_dir);
+        buffer[dir_len] = '/';
+        @memcpy(buffer[dir_len + 1 ..][0..name.len], name);
+
+        return buffer[0 .. dir_len + 1 + name.len];
+    }
+
+    fn clearListing(self: *Player) void {
+        const paths = self.listing orelse return;
+
+        for (paths) |path| self.allocator.free(path);
+        self.allocator.free(paths);
+
+        self.listing = null;
+    }
+
+    /// The sorted "<media_dir>/<clip>" listing, built once and cached.
+    fn mediaListing(self: *Player) ![][]u8 {
+        if (self.listing) |paths| return paths;
 
         var dir = Dir.cwd().openDir(
             self.io,
@@ -222,45 +239,60 @@ pub const Player = struct {
         };
         defer dir.close(self.io);
 
-        var matches: std.ArrayList([]u8) = .empty;
-        defer {
-            for (matches.items) |entry| self.allocator.free(entry);
-            matches.deinit(self.allocator);
+        var paths: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (paths.items) |path| self.allocator.free(path);
+            paths.deinit(self.allocator);
         }
 
+        var scratch: [MAX_PATH]u8 = undefined;
         var iterator = dir.iterate();
+
         while (try iterator.next(self.io)) |entry| {
             if (entry.kind != .file) continue;
             if (!std.ascii.endsWithIgnoreCase(entry.name, sample_extension)) continue;
 
-            try matches.append(
+            // A clip whose full path cannot even be addressed in MAX_PATH is
+            // unusable, so it does not belong in the listing.
+            const joined = self.joinMediaDir(&scratch, entry.name) catch continue;
+
+            try paths.append(
                 self.allocator,
-                try self.allocator.dupe(u8, entry.name),
+                try self.allocator.dupe(u8, joined),
             );
         }
 
-        std.mem.sort([]u8, matches.items, {}, struct {
-            fn lessThan(_: void, a: []u8, b: []u8) bool {
-                return std.mem.lessThan(u8, a, b);
-            }
-        }.lessThan);
+        std.mem.sort([]u8, paths.items, {}, lessThanBytes);
+
+        self.listing = try paths.toOwnedSlice(self.allocator);
+
+        return self.listing.?;
+    }
+
+    /// Resolve `n` to a clip by its position in the media listing, copied into
+    /// `buffer`. `n` is an absolute index into that listing, not a variant of a
+    /// named sample.
+    fn resolveIndex(
+        self: *Player,
+        n: i32,
+        buffer: []u8,
+    ) ![]const u8 {
+        if (n < 0) return error.IndexOutOfRange;
+
+        const paths = try self.mediaListing();
 
         // Out of range is an error, never a clamp: silently playing the last
         // file would look like a working trigger while showing the wrong clip.
-        if (@as(usize, @intCast(n)) >= matches.items.len) {
+        if (@as(usize, @intCast(n)) >= paths.len) {
             return error.IndexOutOfRange;
         }
 
-        const chosen = matches.items[@intCast(n)];
-        const dir_len = self.media_dir.len;
+        const chosen = paths[@intCast(n)];
 
-        if (dir_len + 1 + chosen.len > buffer.len) return error.NameTooLong;
+        if (chosen.len > buffer.len) return error.NameTooLong;
 
-        @memcpy(buffer[0..dir_len], self.media_dir);
-        buffer[dir_len] = '/';
-        @memcpy(buffer[dir_len + 1 ..][0..chosen.len], chosen);
-
-        return buffer[0 .. dir_len + 1 + chosen.len];
+        @memcpy(buffer[0..chosen.len], chosen);
+        return buffer[0..chosen.len];
     }
 
     fn resolveSample(
@@ -292,25 +324,21 @@ pub const Player = struct {
             return buffer[0..name.len];
         }
 
-        const dir_len = self.media_dir.len;
-        const entry_name = name;
+        const base = try self.joinMediaDir(buffer, name);
 
-        if (dir_len + 1 + entry_name.len + sample_extension.len > buffer.len) {
+        if (base.len + sample_extension.len > buffer.len) {
             return error.NameTooLong;
         }
 
-        // Non-recursive existence check: a name is a file, not a directory to
-        // walk, so a single open is both the test and the answer.
-        @memcpy(buffer[0..dir_len], self.media_dir);
-        buffer[dir_len] = '/';
-        @memcpy(buffer[dir_len + 1 ..][0..entry_name.len], entry_name);
         @memcpy(
-            buffer[dir_len + 1 + entry_name.len ..][0..sample_extension.len],
+            buffer[base.len..][0..sample_extension.len],
             sample_extension,
         );
 
-        const path = buffer[0 .. dir_len + 1 + entry_name.len + sample_extension.len];
+        const path = buffer[0 .. base.len + sample_extension.len];
 
+        // Non-recursive existence check: a name is a file, not a directory to
+        // walk, so a single open is both the test and the answer.
         var file = Dir.cwd().openFile(self.io, path, .{}) catch |err| switch (err) {
             error.FileNotFound => return error.SampleNotFound,
             else => return err,
@@ -349,40 +377,40 @@ pub const Player = struct {
     pub fn takeLatestFrame(
         self: *Player,
     ) ?video.FrameHandle {
-        self.mutex.lockUncancelable(self.io);
-        const index = self.state.current_video;
-        self.mutex.unlock(self.io);
-
-        if (index) |i| {
-            if (self.videos[i]) |v| {
-                return v.mailbox.takeLatest();
-            }
-        }
-
-        return null;
+        const active = self.activeVideo() orelse return null;
+        return active.takeLatestFrame();
     }
 
     pub fn releaseFrame(
-        self: *Player,
-        handle: video.FrameHandle,
+        _: *Player,
+        frame: video.FrameHandle,
     ) void {
-        self.mutex.lockUncancelable(self.io);
-        const index = self.state.current_video;
-        self.mutex.unlock(self.io);
-
-        if (index) |i| {
-            if (self.videos[i]) |v| {
-                v.mailbox.release(handle.slot_index);
-                return;
-            }
-        }
+        // The handle names the mailbox it came from, so a clip switch between
+        // take and release cannot make this return the slot to the wrong one.
+        frame.owner.release();
     }
 
-    pub fn getState(self: *Player) PlayerState {
+    /// The clip the pattern is currently playing, or null before the first
+    /// load. Entries are only ever set from null and closed at shutdown, so a
+    /// pointer read here stays valid for the rest of the process.
+    fn activeVideo(
+        self: *Player,
+    ) ?*video.VideoFile {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        return self.state;
+        const index = self.current_video orelse return null;
+        return self.videos[index];
+    }
+
+    fn assignActive(
+        self: *Player,
+        index: usize,
+    ) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        self.current_video = index;
     }
 
     fn workerMain(self: *Player) void {
@@ -485,13 +513,13 @@ pub const Player = struct {
                 self.stop_at_ns = null;
 
                 if (t.duration > 0) {
-                    self.stop_at_ns = self.nowNs() + @as(
+                    self.stop_at_ns = util.nowNs(self.io) + @as(
                         u64,
                         @intFromFloat(t.duration * 1_000_000_000.0),
                     );
                 }
 
-                const target = self.getActiveVideo() orelse {
+                const target = self.activeVideo() orelse {
                     std.log.warn(
                         "trigger #{d} ignored: no clip to play",
                         .{t.generation},
@@ -503,7 +531,7 @@ pub const Player = struct {
                     self.stop_position_seconds = t.end * target.duration_seconds;
                 }
 
-                const startNs = self.nowNs();
+                const start_ns = util.nowNs(self.io);
 
                 const meta = target.seekNormalized(t.begin) catch |err| {
                     std.log.err(
@@ -513,7 +541,6 @@ pub const Player = struct {
                     continue;
                 };
 
-                self.updatePosition(meta.position_seconds);
                 last_pts = meta.pts;
 
                 std.log.info(
@@ -523,7 +550,7 @@ pub const Player = struct {
                         meta.position_seconds,
                         target.duration_seconds,
                         meta.pts,
-                        @as(f64, @floatFromInt(self.nowNs() - startNs)) /
+                        @as(f64, @floatFromInt(util.nowNs(self.io) - start_ns)) /
                             1_000_000.0,
                     },
                 );
@@ -532,28 +559,27 @@ pub const Player = struct {
                 continue;
             }
 
-            const active = self.getActiveVideo();
-
-            if (active == null) {
-                self.sleepNs(1_000_000);
+            const v = self.activeVideo() orelse {
+                util.sleepNs(self.io, 1_000_000);
                 continue;
-            }
-
-            const v = active.?;
+            };
 
             if (self.slice_finished) {
-                self.sleepNs(1_000_000);
+                util.sleepNs(self.io, 1_000_000);
                 continue;
             }
 
-            const decode_start = self.nowNs();
+            const decode_start = util.nowNs(self.io);
 
             const meta = v.decodeAndPublish() catch |err| {
                 if (err == error.EndOfStream) {
                     // Hold the last frame. A sample plays its slice once and
                     // waits for the next event; looping on its own would fight
                     // the pattern that drives zap.
-                    self.finishSlice("reached the end of the clip");
+                    self.finishSlice(
+                        "reached the end of the clip",
+                        v.duration_seconds,
+                    );
 
                     continue;
                 }
@@ -563,13 +589,11 @@ pub const Player = struct {
                     .{@errorName(err)},
                 );
 
-                self.sleepNs(5_000_000);
+                util.sleepNs(self.io, 5_000_000);
                 continue;
             };
 
-            const decode_ns = self.nowNs() - decode_start;
-
-            self.updatePosition(meta.position_seconds);
+            const decode_ns = util.nowNs(self.io) - decode_start;
 
             if (last_pts) |previous_pts| {
                 const delta_pts = meta.pts - previous_pts;
@@ -577,7 +601,7 @@ pub const Player = struct {
                 if (delta_pts > 0) {
                     const delta_seconds =
                         @as(f64, @floatFromInt(delta_pts)) *
-                        cTimeBase(v.time_base);
+                        c.av_q2d(v.time_base);
 
                     const interval_ns: u64 = @intFromFloat(
                         delta_seconds * 1_000_000_000.0,
@@ -589,13 +613,13 @@ pub const Player = struct {
                     // which runs the whole video slow and spreads decode jitter
                     // across every frame boundary.
                     if (deadline_ns == 0) {
-                        deadline_ns = self.nowNs();
+                        deadline_ns = util.nowNs(self.io);
                     }
                     deadline_ns += interval_ns;
 
-                    const now = self.nowNs();
+                    const now = util.nowNs(self.io);
                     if (deadline_ns > now) {
-                        self.sleepNs(deadline_ns - now);
+                        util.sleepNs(self.io, deadline_ns - now);
                     } else {
                         // Behind schedule: resync instead of carrying the debt
                         // forward, otherwise one slow frame shifts every later
@@ -612,14 +636,14 @@ pub const Player = struct {
             // clears them.
             if (self.stop_position_seconds) |stop_position| {
                 if (meta.position_seconds >= stop_position) {
-                    self.finishSlice("reached end");
+                    self.finishSlice("reached end", meta.position_seconds);
                     continue;
                 }
             }
 
             if (self.stop_at_ns) |deadline| {
-                if (self.nowNs() >= deadline) {
-                    self.finishSlice("reached duration");
+                if (util.nowNs(self.io) >= deadline) {
+                    self.finishSlice("reached duration", meta.position_seconds);
                     continue;
                 }
             }
@@ -644,6 +668,7 @@ pub const Player = struct {
     fn finishSlice(
         self: *Player,
         reason: []const u8,
+        position: f64,
     ) void {
         if (self.slice_finished) return;
 
@@ -651,7 +676,7 @@ pub const Player = struct {
 
         std.log.info(
             "slice finished at {d:.3}s: {s}",
-            .{ self.state.position, reason },
+            .{ position, reason },
         );
     }
 
@@ -662,10 +687,16 @@ pub const Player = struct {
         self: *Player,
         path: []const u8,
     ) void {
-        for (&self.videos, 0..) |*entry, i| {
-            if (entry.*) |v| {
+        for (self.videos, 0..) |entry, i| {
+            if (entry) |v| {
                 if (std.mem.eql(u8, v.path, path)) {
-                    self.setActiveVideo(i);
+                    self.assignActive(i);
+
+                    std.log.info(
+                        "active video index={d} path={s}",
+                        .{ i, v.path },
+                    );
+
                     return;
                 }
             }
@@ -715,89 +746,18 @@ pub const Player = struct {
             return;
         }
 
-        const i = index.?;
-
-        self.mutex.lockUncancelable(self.io);
-
-        self.state.current_video = i;
-        self.state.duration = new_video.duration_seconds;
-        self.state.position = 0;
-        self.state.fps = new_video.fps;
-        self.state.video_width = new_video.width;
-        self.state.video_height = new_video.height;
-
-        self.mutex.unlock(self.io);
+        self.assignActive(index.?);
 
         std.log.info(
             "loaded video index={d} path={s}",
-            .{ i, path },
+            .{ index.?, path },
         );
     }
-
-    fn setActiveVideo(
-        self: *Player,
-        index: usize,
-    ) void {
-        if (self.videos[index]) |v| {
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
-
-            self.state.current_video = index;
-            self.state.duration = v.duration_seconds;
-            self.state.position = 0;
-            self.state.fps = v.fps;
-            self.state.video_width = v.width;
-            self.state.video_height = v.height;
-
-            std.log.info(
-                "active video index={d} path={s}",
-                .{ index, v.path },
-            );
-        }
-    }
-
-    fn getActiveVideo(
-        self: *Player,
-    ) ?*video.VideoFile {
-        self.mutex.lockUncancelable(self.io);
-        const index = self.state.current_video;
-        self.mutex.unlock(self.io);
-
-        if (index) |i| {
-            return self.videos[i];
-        }
-
-        return null;
-    }
-
-    fn updatePosition(
-        self: *Player,
-        position: f64,
-    ) void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-
-        self.state.position = position;
-    }
-
-    fn nowNs(self: *Player) u64 {
-        return @intCast(std.Io.Clock.now(.awake, self.io).nanoseconds);
-    }
-
-    fn sleepNs(self: *Player, nanoseconds: u64) void {
-        self.io.sleep(
-            .fromNanoseconds(nanoseconds),
-            .awake,
-        ) catch |err| switch (err) {
-            error.Canceled => {},
-        };
-    }
-
-    fn cTimeBase(tb: anytype) f64 {
-        return @as(f64, @floatFromInt(tb.num)) /
-            @as(f64, @floatFromInt(tb.den));
-    }
 };
+
+fn lessThanBytes(_: void, a: []u8, b: []u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
 
 fn clampUnit(value: f64) f64 {
     if (std.math.isNan(value)) return 0;

@@ -24,8 +24,8 @@ This is intentionally NOT a general-purpose media player.
 - exact-frame seeking: keyframe backward, then decode forward to the target
 - persistent FFmpeg demuxer/decoder
 - H.264 decoding
-- resolution validation (any even size up to 3840x2160)
-- 30 fps source contract, enforced with a warning
+- resolution validation (exactly 1920x1080)
+- 30 fps source contract, enforced as a hard failure
 - fixed-FPS metadata
 - decoder flushing after seek
 - absolute-deadline frame pacing
@@ -149,7 +149,7 @@ mailbox and the monotonic clock:
 
 Expected shape:
 
-    info(video): opened ...: 1920x1080, fps=30.000, duration=...
+    info(video): opened /path/clip.mp4: 1920x1080 @ 30.000 fps, duration=6.000s
     Results: seek -> decoded target frame
          min: 1.2 ms
       median: 12.0 ms
@@ -187,7 +187,7 @@ the requested frame.
 If an event cannot take effect, the player says so at `warning` level, which
 is visible in every build mode:
 
-    warning: trigger #7: s "bd" n=null is not in 'media'; event ignored
+    warning: trigger #7: s "bd" n=0 is not in 'media'; event ignored
     warning: trigger #6: n=9 is past the end of 'media'; event ignored
 
 A quiet log after a command means the packet never arrived. Check that the
@@ -278,7 +278,7 @@ A sample name that does not resolve drops the whole event. The picture
 currently on screen is left completely untouched, because half-applying a
 mistyped event (restarting the current clip) is worse than doing nothing:
 
-    warning: trigger #7: s "bd" n=null is not in 'media'; event ignored
+    warning: trigger #7: s "bd" n=0 is not in 'media'; event ignored
 
 ### `begin` and `end`
 
@@ -328,7 +328,7 @@ The current player expects:
 
 - MP4
 - H.264
-- any even resolution up to 3840x2160 (1080p and 1440x1080 both work)
+- exactly 1920x1080
 - progressive
 - fixed frame rate, 30 fps
 - YUV420P decoder output
@@ -348,11 +348,20 @@ Two reasons, and the second is the one that makes the picture look wrong.
 
 The prepared sources are normalized to 30 fps so the picture stays aligned
 with the SuperDirt clock driving the matching WAV. A clip at another rate
-still plays, but it drifts against the audio, which is far more confusing
-than a refusal, so zap warns loudly instead of rejecting it:
+drifts against the audio, and drifting is far more confusing to debug than a
+refusal, so zap rejects it:
 
-    warning: bd.mp4 runs at 25.000 fps, not 30.0 fps: it will drift against
-    the SuperDirt clock. Re-encode it to 30 fps.
+    error(video): unsupported frame rate: 25.000 fps; zap only accepts
+    30.0 fps (within 0.10), because the picture has to divide evenly into
+    the display refresh. Re-encode it.
+
+Resolution is checked the same way, against 1920x1080 exactly:
+
+    error(video): unsupported resolution: 1440x1080; zap only accepts
+    1920x1080
+
+Both are checked before a decoder, a packet, or a frame mailbox is
+allocated, so a clip that cannot play costs one demux and nothing else.
 
 The display refresh is the other reason. Presentation is vsync-locked, so
 every source frame is shown for a whole number of display refreshes. On a
@@ -549,7 +558,9 @@ The renderer uses:
           v
     display
 
-The mailbox avoids allocating a new 1080p buffer for every frame.
+The mailbox avoids allocating a new 1080p buffer for every frame, and every
+source is 1920x1080, so the SDL texture is allocated once at startup and
+never resized.
 
 Presentation is vsync-locked: `SDL_SetRenderVSync(renderer, 1)`, and the
 main loop has no sleep of its own, because `SDL_RenderPresent` already

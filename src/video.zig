@@ -1,11 +1,28 @@
 const std = @import("std");
 const c = @import("c");
 
+const util = @import("util.zig");
+
 const log = std.log.scoped(.video);
 
-/// Prepared sources are encoded at 30 fps so that zap's picture lines up
-/// with the SuperDirt clock driving the matching WAV. 29.97 (30000/1001) is
-/// accepted as the NTSC flavour of 30.
+/// The source contract. Every clip zap accepts is exactly 1920x1080 at 30 fps,
+/// because that is what the SuperDirt clock expects and what divides evenly
+/// into a 60 Hz refresh. Anything else is rejected instead of played wrong.
+pub const frame_width: usize = 1920;
+pub const frame_height: usize = 1080;
+
+const uv_width: usize = frame_width / 2;
+const uv_height: usize = frame_height / 2;
+
+/// Plane strides, which are fixed because the frame size is fixed. The mailbox
+/// copies planes tightly packed, so the stride is simply the row length.
+pub const luma_pitch: i32 = @intCast(frame_width);
+pub const chroma_pitch: i32 = @intCast(uv_width);
+
+const y_size: usize = frame_width * frame_height;
+const uv_size: usize = uv_width * uv_height;
+
+/// 29.97 (30000/1001) is the NTSC flavour of 30 and stays inside this window.
 const expected_fps: f64 = 30.0;
 const fps_tolerance: f64 = 0.1;
 
@@ -15,34 +32,25 @@ pub const FrameMeta = struct {
 };
 
 pub const FrameHandle = struct {
-    width: i32,
-    height: i32,
-
     y: []const u8,
     u: []const u8,
     v: []const u8,
 
-    y_pitch: i32,
-    u_pitch: i32,
-    v_pitch: i32,
+    luma_pitch: i32,
+    chroma_pitch: i32,
 
     meta: FrameMeta,
 
-    slot_index: usize,
+    /// The mailbox this frame was taken from. Carrying it means a release
+    /// cannot land in a different clip's mailbox when a trigger switches the
+    /// active video between take and release.
+    owner: *FrameMailbox,
 };
 
 const FrameSlot = struct {
     y: []u8,
     u: []u8,
     v: []u8,
-
-    y_len: usize = 0,
-    u_len: usize = 0,
-    v_len: usize = 0,
-
-    y_pitch: i32 = 0,
-    u_pitch: i32 = 0,
-    v_pitch: i32 = 0,
 
     meta: FrameMeta = .{
         .pts = 0,
@@ -58,31 +66,41 @@ const FrameSlot = struct {
     };
 };
 
+/// Copy one plane, row by row, out of a decoder buffer whose stride may be
+/// padded, into a tightly packed destination.
+fn copyPlane(
+    dst: []u8,
+    src: [*c]u8,
+    src_pitch: i32,
+    width: usize,
+    height: usize,
+) void {
+    var row: usize = 0;
+    while (row < height) : (row += 1) {
+        const from = src + row * @as(usize, @intCast(src_pitch));
+        const to = row * width;
+        @memcpy(dst[to .. to + width], from[0..width]);
+    }
+}
+
 pub const FrameMailbox = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
 
-    width: usize,
-    height: usize,
-
-    slots: [2]FrameSlot,
+    slots: [slot_count]FrameSlot,
 
     mutex: std.Io.Mutex = .init,
+
+    /// One slot is being uploaded to the GPU, the other is being decoded into.
+    const slot_count = 2;
 
     pub fn init(
         io: std.Io,
         allocator: std.mem.Allocator,
-        width: usize,
-        height: usize,
     ) !FrameMailbox {
-        const y_size = width * height;
-        const uv_size = (width / 2) * (height / 2);
-
         var mailbox = FrameMailbox{
             .io = io,
             .allocator = allocator,
-            .width = width,
-            .height = height,
             .slots = undefined,
         };
 
@@ -160,59 +178,9 @@ pub const FrameMailbox = struct {
             return;
         };
 
-        const y_pitch = f.linesize[0];
-        const u_pitch = f.linesize[1];
-        const v_pitch = f.linesize[2];
-
-        const y_height = self.height;
-        const uv_height = self.height / 2;
-
-        var y_offset: usize = 0;
-        var u_offset: usize = 0;
-        var v_offset: usize = 0;
-
-        const y_ptr = f.data[0];
-        const u_ptr = f.data[1];
-        const v_ptr = f.data[2];
-
-        var row: usize = 0;
-        while (row < y_height) : (row += 1) {
-            const src = y_ptr + row * @as(usize, @intCast(y_pitch));
-            const dst = slot.y[y_offset .. y_offset + self.width];
-
-            @memcpy(dst, src[0..self.width]);
-
-            y_offset += self.width;
-        }
-
-        const uv_width = self.width / 2;
-
-        row = 0;
-        while (row < uv_height) : (row += 1) {
-            const u_src = u_ptr + row * @as(usize, @intCast(u_pitch));
-            const v_src = v_ptr + row * @as(usize, @intCast(v_pitch));
-
-            @memcpy(
-                slot.u[u_offset .. u_offset + uv_width],
-                u_src[0..uv_width],
-            );
-
-            @memcpy(
-                slot.v[v_offset .. v_offset + uv_width],
-                v_src[0..uv_width],
-            );
-
-            u_offset += uv_width;
-            v_offset += uv_width;
-        }
-
-        slot.y_len = y_offset;
-        slot.u_len = u_offset;
-        slot.v_len = v_offset;
-
-        slot.y_pitch = @intCast(self.width);
-        slot.u_pitch = @intCast(uv_width);
-        slot.v_pitch = @intCast(uv_width);
+        copyPlane(slot.y, f.data[0], f.linesize[0], frame_width, frame_height);
+        copyPlane(slot.u, f.data[1], f.linesize[1], uv_width, uv_height);
+        copyPlane(slot.v, f.data[2], f.linesize[2], uv_width, uv_height);
 
         slot.meta = meta;
         slot.state = .ready;
@@ -249,30 +217,24 @@ pub const FrameMailbox = struct {
         slot.state = .displaying;
 
         return .{
-            .width = @intCast(self.width),
-            .height = @intCast(self.height),
+            .y = slot.y[0..y_size],
+            .u = slot.u[0..uv_size],
+            .v = slot.v[0..uv_size],
 
-            .y = slot.y[0..slot.y_len],
-            .u = slot.u[0..slot.u_len],
-            .v = slot.v[0..slot.v_len],
-
-            .y_pitch = slot.y_pitch,
-            .u_pitch = slot.u_pitch,
-            .v_pitch = slot.v_pitch,
+            .luma_pitch = luma_pitch,
+            .chroma_pitch = chroma_pitch,
 
             .meta = slot.meta,
 
-            .slot_index = index,
+            .owner = self,
         };
     }
 
-    pub fn release(self: *FrameMailbox, slot_index: usize) void {
+    pub fn release(self: *FrameMailbox) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        if (slot_index < self.slots.len) {
-            const slot = &self.slots[slot_index];
-
+        for (&self.slots) |*slot| {
             if (slot.state == .displaying) {
                 slot.state = .free;
             }
@@ -293,9 +255,6 @@ pub const VideoFile = struct {
 
     video_stream_index: usize,
     time_base: c.AVRational,
-
-    width: usize,
-    height: usize,
 
     fps: f64,
 
@@ -372,21 +331,39 @@ pub const VideoFile = struct {
             return error.UnsupportedCodec;
         }
 
+        // Everything about the source is checked before anything is allocated
+        // for it, so a clip that cannot be played costs one demux and no
+        // decoder, no packet, and no mailbox.
         const width: usize = @intCast(codecpar.width);
         const height: usize = @intCast(codecpar.height);
 
-        // yuv420p needs even dimensions for every plane, and the renderer
-        // letterboxes anything that does not match the logical presentation
-        // size, so only reject what genuinely cannot be decoded.
-        if (width == 0 or height == 0 or
-            (width & 1) != 0 or (height & 1) != 0 or
-            width > 3840 or height > 2160)
-        {
+        if (width != frame_width or height != frame_height) {
             log.err(
-                "unsupported resolution: {d}x{d} (want non-zero, even, at most 3840x2160)",
-                .{ width, height },
+                "unsupported resolution: {d}x{d}; zap only accepts {d}x{d}",
+                .{ width, height, frame_width, frame_height },
             );
             return error.UnsupportedResolution;
+        }
+
+        const guessed_fps = c.av_guess_frame_rate(
+            fmt,
+            video_stream_ptr,
+            null,
+        );
+
+        var fps: f64 = 0;
+
+        if (guessed_fps.den != 0) {
+            fps = @as(f64, @floatFromInt(guessed_fps.num)) /
+                @as(f64, @floatFromInt(guessed_fps.den));
+        }
+
+        if (fps <= 0 or @abs(fps - expected_fps) > fps_tolerance) {
+            log.err(
+                "unsupported frame rate: {d:.3} fps; zap only accepts {d:.1} fps (within {d:.2}), because the picture has to divide evenly into the display refresh. Re-encode it.",
+                .{ fps, expected_fps, fps_tolerance },
+            );
+            return error.UnsupportedFrameRate;
         }
 
         const decoder = c.avcodec_find_decoder(codecpar.codec_id) orelse {
@@ -424,19 +401,6 @@ pub const VideoFile = struct {
 
         errdefer c.av_frame_free(&frame);
 
-        const guessed_fps = c.av_guess_frame_rate(
-            fmt,
-            video_stream_ptr,
-            null,
-        );
-
-        var fps: f64 = 0;
-
-        if (guessed_fps.den != 0) {
-            fps = @as(f64, @floatFromInt(guessed_fps.num)) /
-                @as(f64, @floatFromInt(guessed_fps.den));
-        }
-
         var duration_ts = video_stream.duration;
 
         if (duration_ts == c.AV_NOPTS_VALUE) {
@@ -465,8 +429,6 @@ pub const VideoFile = struct {
         const mailbox = try FrameMailbox.init(
             io,
             allocator,
-            width,
-            height,
         );
 
         const self = try allocator.create(VideoFile);
@@ -484,9 +446,6 @@ pub const VideoFile = struct {
             .video_stream_index = stream_index,
             .time_base = video_stream.time_base,
 
-            .width = width,
-            .height = height,
-
             .fps = fps,
 
             .duration_ts = duration_ts,
@@ -496,24 +455,15 @@ pub const VideoFile = struct {
         };
 
         log.info(
-            "opened {s}: {d}x{d}, fps={d:.3}, duration={d:.3}s",
+            "opened {s}: {d}x{d} @ {d:.3} fps, duration={d:.3}s",
             .{
                 path,
-                width,
-                height,
+                frame_width,
+                frame_height,
                 fps,
                 duration_seconds,
             },
         );
-
-        // Not a hard failure: a wrong rate still plays, it just drifts against
-        // the audio clock, which is far more confusing than a refusal.
-        if (fps > 0 and @abs(fps - expected_fps) > fps_tolerance) {
-            log.warn(
-                "{s} runs at {d:.3} fps, not {d:.1} fps: it will drift against the SuperDirt clock. Re-encode it to 30 fps.",
-                .{ path, fps, expected_fps },
-            );
-        }
 
         return self;
     }
@@ -545,7 +495,7 @@ pub const VideoFile = struct {
             @as(f64, @floatFromInt(duration)) * clamped,
         );
 
-        const start_ns = std.Io.Clock.now(.awake, self.io).nanoseconds;
+        const start_ns = util.nowNs(self.io);
 
         // Seek to the keyframe at or before the target, not to the next one.
         // With AVSEEK_FLAG_ANY the demuxer happily hands back a later keyframe,
@@ -580,14 +530,13 @@ pub const VideoFile = struct {
 
         self.mailbox.publish(self.frame, meta) catch {};
 
-        const elapsed_ns = std.Io.Clock.now(.awake, self.io).nanoseconds - start_ns;
-
         log.debug(
             "seek {d:.4} -> {d:.3}s in {d:.2}ms",
             .{
                 clamped,
                 meta.position_seconds,
-                @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0,
+                @as(f64, @floatFromInt(util.nowNs(self.io) - start_ns)) /
+                    1_000_000.0,
             },
         );
 
@@ -694,12 +643,5 @@ pub const VideoFile = struct {
 
     pub fn takeLatestFrame(self: *VideoFile) ?FrameHandle {
         return self.mailbox.takeLatest();
-    }
-
-    pub fn releaseFrame(
-        self: *VideoFile,
-        frame: FrameHandle,
-    ) void {
-        self.mailbox.release(frame.slot_index);
     }
 };
