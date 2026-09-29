@@ -11,7 +11,6 @@ pub const MAX_VIDEOS = 64;
 pub const MAX_PATH = 4096;
 pub const MAX_NAME = 256;
 
-const default_media_dir = "media";
 const sample_extension = ".mp4";
 
 /// One OSC event, in SuperDirt shape.
@@ -25,18 +24,18 @@ const TriggerState = struct {
     /// can never be applied piecemeal.
     generation: u64 = 0,
 
-    /// Empty means "keep the current clip", which is what a bare retrigger
-    /// should do.
+    /// The collection to play from, which is a directory of clips under the
+    /// media directory. Empty means "keep the current clip", so a retrigger
+    /// that only re-slices needs no name.
     name: [MAX_NAME]u8 = undefined,
     name_len: usize = 0,
 
     begin: f64 = 0,
     end: f64 = 0,
-    /// Sample number. Optional, defaulting to 0. Because SuperDirt sends `n`
-    /// on every event with 0 as its default, 0 cannot mean "the first file" or
-    /// every event would resolve to the first clip in the directory. So only a
-    /// number greater than 0 selects by position; 0 leaves the sample name in
-    /// charge.
+    /// Which clip inside the named collection, counted from 0 in sorted order.
+    /// SuperDirt sends 0 on every event as its default, so 0 meaning "the
+    /// first clip" is not a collision: an absent `n` and an explicit `n 0` are
+    /// the same request, and both mean the first clip of the collection.
     n: i32 = 0,
     duration: f64 = 0,
 };
@@ -72,43 +71,30 @@ pub const Player = struct {
     stop_at_ns: ?u64 = null,
     slice_finished: bool = false,
 
-    /// Where `s` names are looked up. Owned only when it differs from the
-    /// default, so the common case needs no allocation.
-    media_dir: []const u8 = default_media_dir,
-    owned_media_dir: ?[]u8 = null,
+    /// Root that holds the collections. Required, and fixed for the lifetime
+    /// of the process, so it is borrowed from the command line rather than
+    /// owned and re-owned by a setter that nothing needs.
+    media_dir: []const u8,
 
-    /// Sorted "<media_dir>/<clip>" paths for every clip in the media
-    /// directory, built on first use and kept. A pattern fires many events a
-    /// second, and rescanning and re-sorting the directory per event is real
-    /// work to produce an answer that cannot have changed.
-    listing: ?[][]u8 = null,
+    /// Collection name -> that directory's clips, sorted. Built once at
+    /// startup because the media directory is known before the first event:
+    /// the layout is then reported immediately instead of at the worst possible
+    /// moment, and a pattern firing many events a second never pays for a
+    /// rescan.
+    collections: std.StringArrayHashMapUnmanaged([][]u8) = .empty,
 
-    pub fn init(io: std.Io, allocator: Allocator) Player {
+    scanned: bool = false,
+
+    pub fn init(
+        io: std.Io,
+        allocator: Allocator,
+        media_dir: []const u8,
+    ) Player {
         return .{
             .io = io,
             .allocator = allocator,
+            .media_dir = media_dir,
         };
-    }
-
-    pub fn setMediaDir(
-        self: *Player,
-        dir: []const u8,
-    ) !void {
-        if (self.owned_media_dir) |owned| {
-            self.allocator.free(owned);
-            self.owned_media_dir = null;
-        }
-
-        self.clearListing();
-
-        if (std.mem.eql(u8, dir, default_media_dir)) {
-            self.media_dir = default_media_dir;
-            return;
-        }
-
-        const owned = try self.allocator.dupe(u8, dir);
-        self.owned_media_dir = owned;
-        self.media_dir = owned;
     }
 
     pub fn start(self: *Player) !void {
@@ -140,12 +126,14 @@ pub const Player = struct {
             }
         }
 
-        self.clearListing();
+        var it = self.collections.iterator();
 
-        if (self.owned_media_dir) |owned| {
-            self.allocator.free(owned);
-            self.owned_media_dir = null;
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.freeCollection(entry.value_ptr.*);
         }
+
+        self.collections.deinit(self.allocator);
     }
 
     /// Apply one OSC event. Every parameter is optional: an empty name keeps
@@ -216,22 +204,110 @@ pub const Player = struct {
         return buffer[0 .. dir_len + 1 + name.len];
     }
 
-    fn clearListing(self: *Player) void {
-        const paths = self.listing orelse return;
-
+    fn freeCollection(
+        self: *Player,
+        paths: [][]u8,
+    ) void {
         for (paths) |path| self.allocator.free(path);
         self.allocator.free(paths);
-
-        self.listing = null;
     }
 
-    /// The sorted "<media_dir>/<clip>" listing, built once and cached.
-    fn mediaListing(self: *Player) ![][]u8 {
-        if (self.listing) |paths| return paths;
-
+    /// Read the media directory: every subdirectory is one `s` collection, and
+    /// every clip in it takes the next index in sorted order.
+    ///
+    /// Scanning up front is what makes a `s`/`n` pair a lookup instead of a
+    /// filesystem walk. It also fails at startup, where a missing directory is
+    /// an honest error, instead of at the first `/play`, where the same
+    /// problem would look like a bad pattern.
+    pub fn scan(self: *Player) !void {
         var dir = Dir.cwd().openDir(
             self.io,
             self.media_dir,
+            .{ .iterate = true },
+        ) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => return error.MediaDirNotFound,
+            else => return err,
+        };
+        defer dir.close(self.io);
+
+        var skipped_loose: usize = 0;
+        var collection_count: usize = 0;
+        var clip_count: usize = 0;
+
+        var scratch: [MAX_PATH]u8 = undefined;
+        var iterator = dir.iterate();
+
+        while (try iterator.next(self.io)) |entry| {
+            if (entry.kind != .directory) {
+                if (entry.kind == .file and
+                    std.ascii.endsWithIgnoreCase(entry.name, sample_extension))
+                {
+                    skipped_loose += 1;
+                }
+                continue;
+            }
+
+            // A clip whose full path cannot even be addressed in MAX_PATH is
+            // unusable, so it does not belong in the listing.
+            const collection_dir = self.joinMediaDir(&scratch, entry.name) catch {
+                skipped_loose += 1;
+                continue;
+            };
+
+            const paths = self.scanCollection(collection_dir) catch |err| {
+                std.log.warn(
+                    "could not read collection \"{s}\": {s}; skipped",
+                    .{ entry.name, @errorName(err) },
+                );
+                continue;
+            };
+
+            // The key must be owned: `entry.name` points into the iterator's
+            // own buffer, which the next `next()` call and `close()` both
+            // invalidate, so storing it as-is would leave every lookup reading
+            // freed memory.
+            const key = try self.allocator.dupe(u8, entry.name);
+            errdefer self.allocator.free(key);
+
+            try self.collections.put(self.allocator, key, paths);
+
+            collection_count += 1;
+            clip_count += paths.len;
+        }
+
+        if (skipped_loose > 0) {
+            std.log.warn(
+                "{d} .mp4 file(s) sit directly in '{s}'; clips are grouped " ++
+                    "per subdirectory, so those are not playable",
+                .{ skipped_loose, self.media_dir },
+            );
+        }
+
+        if (collection_count == 0) {
+            std.log.warn(
+                "no collections (subdirectories) found in '{s}'; " ++
+                    "every /play will be ignored",
+                .{self.media_dir},
+            );
+        }
+
+        self.scanned = true;
+
+        std.log.info(
+            "media dir '{s}': {d} collection(s), {d} clip(s)",
+            .{ self.media_dir, collection_count, clip_count },
+        );
+    }
+
+    /// The sorted clips of one collection directory, as full paths. Sorted by
+    /// name so the index a pattern uses is stable across runs.
+    fn scanCollection(
+        self: *Player,
+        collection_dir: []const u8,
+    ) ![][]u8 {
+        var dir = Dir.cwd().openDir(
+            self.io,
+            collection_dir,
             .{ .iterate = true },
         ) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => return error.SampleNotFound,
@@ -252,126 +328,65 @@ pub const Player = struct {
             if (entry.kind != .file) continue;
             if (!std.ascii.endsWithIgnoreCase(entry.name, sample_extension)) continue;
 
-            // A clip whose full path cannot even be addressed in MAX_PATH is
-            // unusable, so it does not belong in the listing.
-            const joined = self.joinMediaDir(&scratch, entry.name) catch continue;
+            if (collection_dir.len + 1 + entry.name.len > scratch.len) continue;
+
+            @memcpy(
+                scratch[0..collection_dir.len],
+                collection_dir,
+            );
+            scratch[collection_dir.len] = '/';
+            @memcpy(
+                scratch[collection_dir.len + 1 ..][0..entry.name.len],
+                entry.name,
+            );
+
+            const path = scratch[0 .. collection_dir.len + 1 + entry.name.len];
 
             try paths.append(
                 self.allocator,
-                try self.allocator.dupe(u8, joined),
+                try self.allocator.dupe(u8, path),
             );
         }
 
         std.mem.sort([]u8, paths.items, {}, lessThanBytes);
 
-        self.listing = try paths.toOwnedSlice(self.allocator);
-
-        return self.listing.?;
+        return paths.toOwnedSlice(self.allocator);
     }
 
-    /// Resolve `n` to a clip by its position in the media listing, copied into
-    /// `buffer`. `n` is an absolute index into that listing, not a variant of a
-    /// named sample.
-    fn resolveIndex(
-        self: *Player,
-        n: i32,
-        buffer: []u8,
-    ) ![]const u8 {
-        if (n < 0) return error.IndexOutOfRange;
-
-        const paths = try self.mediaListing();
-
-        // Out of range is an error, never a clamp: silently playing the last
-        // file would look like a working trigger while showing the wrong clip.
-        if (@as(usize, @intCast(n)) >= paths.len) {
-            return error.IndexOutOfRange;
-        }
-
-        const chosen = paths[@intCast(n)];
-
-        if (chosen.len > buffer.len) return error.NameTooLong;
-
-        @memcpy(buffer[0..chosen.len], chosen);
-        return buffer[0..chosen.len];
-    }
-
+    /// Resolve an event to a clip: `name` picks the collection and `n` picks
+    /// the clip inside it. Returns null when the event carries neither, which
+    /// means "keep whatever is playing".
+    ///
+    /// The returned path is owned by the listing and lives as long as the
+    /// process, so callers must copy it rather than free it.
     fn resolveSample(
         self: *Player,
         name: []const u8,
         n: i32,
-        buffer: []u8,
     ) !?[]const u8 {
-        // A sample number greater than 0 is self-sufficient: it addresses a
-        // file directly by position, so any name on the same event is ignored.
-        if (n > 0) return try self.resolveIndex(n, buffer);
-
-        if (name.len == 0) return null;
-
-        const looks_like_path =
-            std.mem.indexOfScalar(u8, name, '/') != null or
-            std.ascii.endsWithIgnoreCase(name, sample_extension);
-
-        if (looks_like_path) {
-            var file = Dir.cwd().openFile(self.io, name, .{}) catch |err| switch (err) {
-                error.FileNotFound => return null,
-                else => return err,
-            };
-            file.close(self.io);
-
-            if (name.len > buffer.len) return error.NameTooLong;
-
-            @memcpy(buffer[0..name.len], name);
-            return buffer[0..name.len];
+        if (name.len == 0) {
+            // `n` alone cannot address anything: an index is only meaningful
+            // relative to a collection. A plain retrigger carries neither and
+            // keeps the current clip.
+            if (n > 0) return error.IndexWithoutCollection;
+            return null;
         }
 
-        const base = try self.joinMediaDir(buffer, name);
+        if (n < 0) return error.IndexOutOfRange;
 
-        if (base.len + sample_extension.len > buffer.len) {
-            return error.NameTooLong;
-        }
-
-        @memcpy(
-            buffer[base.len..][0..sample_extension.len],
-            sample_extension,
-        );
-
-        const path = buffer[0 .. base.len + sample_extension.len];
-
-        // Non-recursive existence check: a name is a file, not a directory to
-        // walk, so a single open is both the test and the answer.
-        var file = Dir.cwd().openFile(self.io, path, .{}) catch |err| switch (err) {
-            error.FileNotFound => return error.SampleNotFound,
-            else => return err,
+        const paths = self.collections.get(name) orelse {
+            return error.SampleNotFound;
         };
-        file.close(self.io);
 
-        return path;
-    }
+        if (paths.len == 0) return error.CollectionEmpty;
 
-    pub fn requestLoad(
-        self: *Player,
-        path: []const u8,
-    ) void {
-        if (path.len >= MAX_PATH) {
-            std.log.err("LOAD path too long", .{});
-            return;
+        // Out of range is an error, never a clamp: silently playing the last
+        // clip would look like a working trigger while showing the wrong one.
+        if (@as(usize, @intCast(n)) >= paths.len) {
+            return error.IndexOutOfRange;
         }
 
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-
-        @memcpy(
-            self.command.load_path[0..path.len],
-            path,
-        );
-
-        self.command.load_path_len = path.len;
-        self.command.load_pending = true;
-
-        std.log.info(
-            "LOAD queued path={s}",
-            .{path},
-        );
+        return paths[@intCast(n)];
     }
 
     pub fn takeLatestFrame(
@@ -419,8 +434,6 @@ pub const Player = struct {
         var last_pts: ?i64 = null;
         var deadline_ns: u64 = 0;
 
-        var resolve_buffer: [MAX_PATH]u8 = undefined;
-
         while (self.running.load(.acquire)) {
             var load_path: ?[]u8 = null;
             var trigger: ?TriggerState = null;
@@ -463,37 +476,37 @@ pub const Player = struct {
                 self.mutex.unlock(self.io);
 
                 if (t.name_len > 0 or t.n > 0) {
-                    // A sample number addresses a file by position and makes
-                    // the name meaningless, so only look the name up when
-                    // there is no index.
-                    const name = if (t.n == 0)
-                        t.name[0..t.name_len]
-                    else
-                        "";
+                    const name = t.name[0..t.name_len];
 
-                    const resolved = self.resolveSample(
-                        name,
-                        t.n,
-                        &resolve_buffer,
-                    ) catch |err| {
-                        // Drop the whole event. Half-applying it would restart
-                        // whatever is on screen, which is the one thing a typo
-                        // must never do mid-performance.
-                        if (err == error.SampleNotFound) {
-                            std.log.warn(
-                                "trigger #{d}: s \"{s}\" n={d} is not in '{s}'; event ignored",
-                                .{ t.generation, name, t.n, self.media_dir },
-                            );
-                        } else if (err == error.IndexOutOfRange) {
-                            std.log.warn(
-                                "trigger #{d}: n={d} is past the end of '{s}'; event ignored",
-                                .{ t.generation, t.n, self.media_dir },
-                            );
-                        } else {
-                            std.log.warn(
-                                "trigger #{d}: s \"{s}\" n={d}: {s}; event ignored",
-                                .{ t.generation, name, t.n, @errorName(err) },
-                            );
+                    // Drop the whole event on any failure. Half-applying it
+                    // would restart whatever is on screen, which is the one
+                    // thing a typo must never do mid-performance.
+                    const resolved = self.resolveSample(name, t.n) catch |err| {
+                        switch (err) {
+                            error.SampleNotFound => std.log.warn(
+                                "trigger #{d}: no collection \"{s}\" in '{s}'; event ignored",
+                                .{ t.generation, name, self.media_dir },
+                            ),
+                            error.CollectionEmpty => std.log.warn(
+                                "trigger #{d}: collection \"{s}\" has no clips; event ignored",
+                                .{ t.generation, name },
+                            ),
+                            error.IndexOutOfRange => std.log.warn(
+                                "trigger #{d}: n={d} is past the end of collection \"{s}\" ({d} clips); event ignored",
+                                .{
+                                    t.generation,
+                                    t.n,
+                                    name,
+                                    self.collections.get(name).?.len,
+                                },
+                            ),
+                            error.IndexWithoutCollection => std.log.warn(
+                                "trigger #{d}: n={d} with no s; an index only means something inside a collection; event ignored",
+                                .{ t.generation, t.n },
+                            ),
+                            // No catch-all: an unhandled resolution failure is
+                            // a compile error here, so a new failure mode can
+                            // never reach a live performance unannounced.
                         }
 
                         continue;

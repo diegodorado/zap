@@ -81,6 +81,13 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run zap");
     const run_cmd = b.addRunArtifact(exe);
+
+    // Forward everything after `--` to zap. Without this the executable is
+    // started with no arguments at all, so a mandatory <media-dir> can never
+    // be supplied: `zig build run -- my-media` would fail exactly like a bare
+    // `zap` does.
+    run_cmd.addPassthruArgs();
+
     run_step.dependOn(&run_cmd.step);
 
     const fmt_step = b.step("fmt", "Format source");

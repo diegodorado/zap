@@ -11,59 +11,66 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const allocator = init.gpa;
 
-    // -------------------------------------------------------------------------
     // Command-line arguments
-    // -------------------------------------------------------------------------
 
     var args = init.minimal.args.iterate();
 
-    var benchmark_path: ?[]const u8 = null;
-    var initial_path: ?[]const u8 = null;
+    var benchmark_mode = false;
     var media_dir: ?[]const u8 = null;
 
     _ = args.next(); // executable name
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--benchmark")) {
-            benchmark_path = args.next() orelse {
-                log.err("--benchmark requires a video path", .{});
-                return error.MissingBenchmarkPath;
-            };
-            break;
-        }
-
-        if (std.mem.eql(u8, arg, "--media")) {
-            media_dir = args.next() orelse {
-                log.err("--media requires a directory", .{});
-                return error.MissingMediaDir;
-            };
+            benchmark_mode = true;
             continue;
         }
 
-        if (initial_path == null) {
-            initial_path = arg;
+        if (std.mem.startsWith(u8, arg, "-")) {
+            log.err("unknown option '{s}'", .{arg});
+            log.err("usage: zap [--benchmark] <media-dir>", .{});
+            return error.UnknownArgument;
         }
+
+        if (media_dir != null) {
+            log.err("unexpected extra argument '{s}'", .{arg});
+            log.err("usage: zap [--benchmark] <media-dir>", .{});
+            return error.UnexpectedArgument;
+        }
+
+        media_dir = arg;
     }
 
-    // -------------------------------------------------------------------------
-    // Benchmark mode
-    // -------------------------------------------------------------------------
+    // The media directory is not optional. Without it there is nothing for a
+    // `/play` to name, and silently defaulting to a relative "media" that may
+    // not exist is how a working setup turns into a silent one.
 
-    if (benchmark_path) |path| {
+    const path = media_dir orelse {
+        log.err("missing <media-dir>", .{});
+        log.err("usage: zap [--benchmark] <media-dir>", .{});
+        return error.MissingMediaDir;
+    };
+
+    // Benchmark mode: the same positional argument, pointed at a clip instead
+    // of at a collection root.
+
+    if (benchmark_mode) {
         try benchmark.run(io, allocator, path);
         return;
     }
 
-    // -------------------------------------------------------------------------
     // Core systems
-    // -------------------------------------------------------------------------
 
-    var player = Player.init(io, allocator);
+    var player = Player.init(io, allocator, path);
     defer player.deinit();
 
-    if (media_dir) |dir| {
-        try player.setMediaDir(dir);
-    }
+    player.scan() catch |err| {
+        log.err(
+            "cannot use '{s}' as a media directory: {s}",
+            .{ path, @errorName(err) },
+        );
+        return error.MediaDirUnusable;
+    };
 
     try player.start();
 
@@ -78,20 +85,9 @@ pub fn main(init: std.process.Init) !void {
 
     try osc.start();
 
-    // -------------------------------------------------------------------------
-    // Optional initial video
-    // -------------------------------------------------------------------------
-
-    if (initial_path) |path| {
-        player.requestLoad(path);
-    }
-
     log.info("zap started", .{});
 
-    // -------------------------------------------------------------------------
-    // Main/render loop
-    // -------------------------------------------------------------------------
-
+    // render loop
     while (!renderer.pollQuit()) {
         // No sleep: SDL_RenderPresent blocks until the next display refresh,
         // so the loop is paced by the display. Sleeping here added latency and

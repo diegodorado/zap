@@ -15,7 +15,8 @@ This is intentionally NOT a general-purpose media player.
 - SDL3 window and rendering
 - OSC UDP receiver
 - `/play` single-event trigger: SuperDirt key/value pairs, any order
-- sample-name resolution against a media directory (`--media`)
+- collection-based sample resolution: `s` names a directory, `n` names a
+  clip inside it
 - a named clip is opened once and reused by later triggers
 - normalized slice playback (`begin` .. `end`) with the last frame held
 - wall-clock `duration` cutoff
@@ -125,12 +126,12 @@ The executable can also be invoked directly:
 
     ./zig-out/bin/zap /Users/me/Videos/clip01.mp4
 
-To play samples by name from a media directory:
+To play samples, point zap at a media directory:
 
-    ./zig-out/bin/zap --media /Users/me/Videos
+    ./zig-out/bin/zap /Users/me/my-media
 
-The directory is searched for `<name>.mp4` when a `/play` event omits a
-path. It defaults to `media`.
+The media directory is mandatory and has no default, because without it
+there is nothing for a `/play` to name.
 
 ---
 
@@ -166,18 +167,18 @@ rather than being folded into the percentiles.
 
 Start the player against a media directory, then drive it:
 
-    ./zig-out/bin/zap --media /Users/me/Videos
+    ./zig-out/bin/zap /Users/me/my-media
 
 In another terminal:
 
-    oscsend 127.0.0.1 9000 "/play" s "s" s "clip01" s "begin" f 0.25 s "end" f 0.75
-    oscsend 127.0.0.1 9000 "/play" s "s" s "clip01" s "delta" f 0.25 s "legato" f 0.5
-    oscsend 127.0.0.1 9000 "/play" s "n" f 0 s "begin" f 0.5
+    oscsend 127.0.0.1 9000 "/play" s "s" s "bd" s "begin" f 0.25 s "end" f 0.75
+    oscsend 127.0.0.1 9000 "/play" s "s" s "bd" s "delta" f 0.25 s "legato" f 0.5
+    oscsend 127.0.0.1 9000 "/play" s "s" s "bd" s "n" f 3 s "begin" f 0.5
 
 Every `/play` is logged, and the worker logs the frame it actually landed
 on, which is the thing worth checking:
 
-    info: TRIGGER #1 s=clip01 begin=0.2500 end=0.7500 n=null duration=0.000
+    info: TRIGGER #1 s=bd n=0 begin=0.2500 end=0.7500 duration=0.000
     info: trigger #1 began at 3.000s / 4.000s, frame_pts=46080, latency=2.10ms
 
 `begin=0.25` landing on 25% of the stream is the assertion that matters: if
@@ -187,8 +188,8 @@ the requested frame.
 If an event cannot take effect, the player says so at `warning` level, which
 is visible in every build mode:
 
-    warning: trigger #7: s "bd" n=0 is not in 'media'; event ignored
-    warning: trigger #6: n=9 is past the end of 'media'; event ignored
+    warning: trigger #7: no collection "bd" in 'my-media'; event ignored
+    warning: trigger #6: n=9 is past the end of collection "bd" (2 clips); event ignored
 
 A quiet log after a command means the packet never arrived. Check that the
 sender targets UDP 9000 on the same host.
@@ -266,19 +267,40 @@ set. A packet without one parses identically.
 
 ### Resolving `s`
 
-If `s` contains a `/` or ends in `.mp4` it is treated as a path. Otherwise
-it is a sample name looked up in the media directory (`--media`, default
-`media`) as `<name>.mp4`.
+`s` names a **collection**, and a collection is a directory of clips inside
+the media directory:
+
+    my-media/
+      my-sample-x/
+        01.mp4
+        02.mp4
+      my-sample-y/
+        01.mp4
+        03.mp4
+      my-sample-z/
+        01.mp4
+
+So `zap my-media` scans each subdirectory, and `s "my-sample-x"` plays from
+that collection. `s` is only ever a collection name, never a path: a value
+containing a `/` does not escape the media directory, it simply fails to
+match a collection.
 
 Omitting `s` reuses the clip that is already loaded. A clip is opened once;
-later events naming the same sample reuse the open decoder instead of
-re-reading the file.
+later events resolving to the same file reuse the open decoder instead of
+re-reading it.
 
-A sample name that does not resolve drops the whole event. The picture
+The scan happens once at startup, so a pattern firing many events a second
+never pays for a directory walk, and a broken media directory is reported
+when zap starts rather than at the first `/play`:
+
+    info: media dir 'my-media': 3 collection(s), 4 clip(s)
+
+A collection that does not resolve drops the whole event. The picture
 currently on screen is left completely untouched, because half-applying a
 mistyped event (restarting the current clip) is worse than doing nothing:
 
-    warning: trigger #7: s "bd" n=0 is not in 'media'; event ignored
+    warning: trigger #7: no collection "bd" in 'my-media'; event ignored
+    warning: trigger #8: collection "bd" has no clips; event ignored
 
 ### `begin` and `end`
 
@@ -295,30 +317,32 @@ arrives first wins.
 
 ### `n`
 
-`n` is an absolute sample number: the index of a file in the media
-directory, counting `.mp4` files in sorted order.
+`n` is the index of a clip **inside the collection named by `s`**, counting
+that collection's `.mp4` files in sorted order. The two work together:
 
-    /play s "n" f 0 f "begin" f 0 s "n" f 3    # the 4th .mp4
+    /play s "s" s "my-sample-y"          # my-sample-y/01.mp4   (n defaults to 0)
+    /play s "s" s "my-sample-y" s "n" f 1  # my-sample-y/03.mp4
+
+Note the second one. The collection holds `01.mp4` and `03.mp4`, so index
+`1` is `03.mp4`: the index counts the clips that are actually there, it is
+not the number in the filename.
 
 `n` is optional and defaults to `0`, so an event with no `n` and an event
-with `n 0` are the same request.
+with `n 0` are the same request, and both mean the first clip.
 
-`n` addresses a file directly, so it makes a name redundant: **when `n` is
-greater than 0, `s` on the same event is ignored.** A real SuperDirt event
-carries both, which is fine, because zap only needs the number.
+`n` is meaningless without `s`, because an index only means something
+relative to a collection. Such an event is refused rather than guessed at,
+and an event with neither `s` nor `n` keeps the current clip, which is what
+makes a bare retrigger re-slice whatever is playing:
 
-`0` selects nothing, because it is SuperDirt's own default and Tidal sends
-`n` on every event. Treating 0 as "the first file" would make every event
-resolve to the first clip in the directory and the name would never be
-used. So 0 leaves the name in charge.
+    warning: trigger #6: n=9 with no s; an index only means something inside a collection; event ignored
 
-The listing is sorted, so index `0` is the alphabetically first `.mp4` in
-the media directory and indices are stable as long as the file set is. An
-index past the end of the listing is refused, never clamped, because
-silently playing the last file would look like a working event while
-showing the wrong clip:
+Indices are sorted by filename, so they are stable as long as the file set
+is. An index past the end of its collection is refused, never clamped,
+because silently playing the last clip would look like a working event
+while showing the wrong one:
 
-    warning: trigger #6: n=9 is past the end of 'media'; event ignored
+    warning: trigger #6: n=9 is past the end of collection "my-sample-y" (2 clips); event ignored
 
 ---
 
@@ -594,11 +618,11 @@ not synchronize video to an audio clock.
 Audio is SuperDirt's job. The intended workflow is a prepared pair per
 sample:
 
-    media/bd.mp4      -> zap
-    media/bd.wav      -> SuperDirt
+    my-media/bd/01.mp4  -> zap
+    my-media/bd/01.wav  -> SuperDirt
 
-A `/play s "bd" ...` event tells SuperDirt to play `bd.wav` and tells zap to
-show the matching slice of `bd.mp4`. Both are driven by the same clock, so
+A `/play s "bd" s "n" f 0 ...` event tells SuperDirt to play `01.wav` and
+tells zap to show the matching slice of `01.mp4`. Both are driven by the same clock, so
 zap only has to be correct about *which* frames to show and *when* each slice
 starts, not about sample-accurate A/V alignment.
 
