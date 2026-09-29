@@ -497,6 +497,35 @@ pub const VideoFile = struct {
 
         const start_ns = util.nowNs(self.io);
 
+        // The requested position almost never lands on a frame boundary,
+        // because it is a fraction of the stream duration rather than a frame
+        // number. Seeking straight to it therefore lands on the frame *before*
+        // the target, which then has to be decoded and thrown away before the
+        // real frame is decoded too. On an all-intra source that is a wasted
+        // decode of a full 1080p I-frame *and* a wasted read of it, which is
+        // the single largest cost in a seek.
+        //
+        // So seek to the first frame boundary at or after the target instead,
+        // and still accept the first frame at or after `target`. Those pick
+        // the same frame: every frame is on a boundary, so the first frame
+        // >= the target and the first frame >= the next boundary are the same
+        // frame. The seek is what moves onto it, and only the comparison is
+        // left on the exact target. A GOP-encoded source decodes from its
+        // keyframe either way, so nothing regresses there.
+        //
+        // `target` stays as the break condition on purpose: snapping the
+        // comparison too would make a seek near the end of the stream ask for
+        // a frame that does not exist and fail with EndOfStream.
+        const frame_duration: i64 = @intFromFloat(
+            @as(f64, @floatFromInt(self.time_base.den)) /
+                (self.fps * @as(f64, @floatFromInt(self.time_base.num))),
+        );
+
+        const seek_to = if (frame_duration > 1)
+            @divTrunc(target + frame_duration - 1, frame_duration) * frame_duration
+        else
+            target;
+
         // Seek to the keyframe at or before the target, not to the next one.
         // With AVSEEK_FLAG_ANY the demuxer happily hands back a later keyframe,
         // which silently shifts every slice boundary by up to a full GOP.
@@ -504,7 +533,7 @@ pub const VideoFile = struct {
             self.format_ctx,
             @intCast(self.video_stream_index),
             std.math.minInt(i64),
-            target,
+            seek_to,
             std.math.maxInt(i64),
             0,
         );

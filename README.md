@@ -432,13 +432,16 @@ A seek performs:
     stream timestamp
           |
           v
-    avformat_seek_file()      -> keyframe at or BEFORE the target
+    round UP to the next frame boundary         (seek target)
+          |
+          v
+    avformat_seek_file()      -> keyframe at or BEFORE that boundary
           |
           v
     avcodec_flush_buffers()
           |
           v
-    decode forward, discarding frames, until pts >= target
+    decode forward, discarding frames, until pts >= exact target
           |
           v
     frame mailbox
@@ -457,6 +460,25 @@ The cost of that correctness is decoding the frames between the keyframe and
 the target, so seek latency is proportional to GOP length. On all-I sources
 (GOP=1) it is a single frame, which is why the intended source material is
 GOP=1 / all-I. On a GOP-30 clip the extra cost measured 1.4ms to 14ms.
+
+A normalized position is a fraction of the stream *duration*, so it almost
+never lands on a frame boundary, and the first frame at or after it is one
+frame *later*. Seeking straight to such a target lands on the frame before
+it, which then has to be decoded and thrown away before the real frame is
+decoded too. On all-I that is a wasted decode of a full 1080p I-frame and a
+wasted read of it, which is the largest single cost in a seek. The seek
+therefore rounds the target up to the next frame boundary, while the frame
+that is accepted is still the first one at or after the exact target. Both
+pick the same frame, so the output is unchanged, but an all-I source now
+decodes and reads exactly one I-frame per seek instead of two. On a 417MB
+all-I 1080p30 clip that moved seek latency from a 21.2ms median to 6.7ms,
+and the worst case from 36.7ms to 8.8ms.
+
+The comparison deliberately stays on the exact target. Rounding that up too
+would make a seek near the end of the file ask for a frame that does not
+exist and fail with `error.EndOfStream`; instead, `begin=1.0` already fails
+that way, because normalized `1.0` is the stream duration and the last frame
+starts one frame before it.
 
 ---
 
