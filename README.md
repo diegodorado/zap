@@ -238,14 +238,16 @@ zap reads these keys:
 | `begin`  | `f`   | `0`     | normalized start position                  |
 | `end`    | `f`   | `1`     | normalized end position                    |
 | `n`      | `f`   | `0`     | sample number; only > 0 selects by index   |
-| `speed`  | `f`   | `1`     | playback rate; negative plays backwards    |
+| `speed`  | `f`   | `1`     | playback rate or cycle/seconds count, per `unit` |
+| `unit`   | `s`   | `r`     | how to read `speed`: `r`ate, `c`ycles, or `s`econds |
+| `cps`    | `f`   | `0`     | tempo in cycles/sec, needed only for `unit c`     |
 | `delta`  | `f`   | `0`     | event length in seconds                    |
 | `legato` | `f`   | `1`     | length multiplier                          |
 
-Every other key Tidal sends (`cps`, `midichan`, `note`, `velocity`,
-`cc*`, `octave`, ...) is fully read and thrown away. That matters: skipping
-the *value* of an unrecognized key would leave the reader misaligned, and
-every field after it would be garbage.
+Every other key Tidal sends (`midichan`, `note`, `velocity`, `cc*`,
+`octave`, ...) is fully read and thrown away. That matters: skipping the
+*value* of an unrecognized key would leave the reader misaligned, and every
+field after it would be garbage.
 
 `duration` is never transmitted. It is derived, the way SuperDirt derives
 it:
@@ -377,11 +379,16 @@ the stream, find none, and fail with `EndOfStream`. zap clamps the normalized
 seek to the final frame's timestamp instead, which is why the default reverse
 case works at all.
 
-### `speed`
+### `speed` and `unit`
 
-`speed` is the playback rate, defaulting to `1` (the source frame rate). The
-sign carries the direction, and the magnitude scales how fast the timeline
-moves:
+`speed` is a number the pattern sends and `unit` says what that number is. A
+rate is the only reading that is position-independent; the other two depend on
+the tempo and on the clip, so zap resolves them once the clip's duration is
+known. Getting this wrong is not a small error in pacing, it is the whole
+video running at the wrong speed while the audio is correct.
+
+`unit "r"` (or `"rate"`, or no `unit` at all) — the default. `speed` is a
+playback rate: 1 is the source frame rate, 2 is twice as fast.
 
     speed  2    twice as fast, every frame still shown
     speed  0.5  half speed, each frame held for two display refreshes
@@ -389,11 +396,28 @@ moves:
     speed -2    reverse, twice as fast
     speed  0    hold the frame at `begin` and do not move
 
-The rate scales *time*, not the frame step. At `speed 2` the timeline covers
-twice as much content per second, so each frame is on screen half as long and
-no frames are skipped. That is the difference between "plays faster" and
-"plays a longer excerpt at the same speed", and only the first one is what a
-`speed` parameter means.
+`unit "c"` — `speed` is a number of cycles the sample is stretched to fill:
+`speed 2` fills half a cycle. The reading extends, so `speed 2` means the
+sample is to fill `1/2` cycles and `speed 0.25` fills `4`. Fill time is
+`(1 / speed) / cps` seconds, so the rate the clip must be played at is
+
+    rate = duration_seconds * speed * cps
+
+`loopAt` patterns are the main source of this, and they make the value easy to
+misread. A real event (`speed 0.25`, `unit c`, `cps 0.5208333`, a 7.9 s clip)
+fills `1/0.25 = 4` cycles = 7.68 s, so the rate is `7.9 * 0.25 * 0.5208333
+= 1.0286` and the audio happens to agree: each 1/32 slice = 0.2469 s of
+content takes exactly its 0.24 s `delta`. Zap that treated `0.25` as a rate
+ran the picture four times slower than that audio.
+
+`unit "s"` — `speed` is a wall-clock length in seconds the sample is stretched
+to fill, so `rate = duration_seconds / speed`.
+
+The rate always scales *time*, not the frame step. At rate 2 the timeline
+covers twice as much content per second, so each frame is on screen half as
+long and no frames are skipped. That is the difference between "plays faster"
+and "plays a longer excerpt at the same speed", and only the first one is what
+a `speed` parameter means.
 
 `speed 0` is degenerate rather than fast. There is no direction to move in, so
 zap holds the frame the event landed on for the length of the slice and warns
@@ -413,9 +437,12 @@ published, because with two frames in flight it has to decide which one is the
 Picking by timestamp alone would pin the picture on the first frame of a
 reverse slice.
 
-`speed` is clamped to `±8`. Past that the wall-clock interval per frame drops
-below what one seek and one decode fit inside, and extra rate stops being extra
-motion and starts being dropped frames.
+Rates are clamped to `±8`. Past that the wall-clock interval per frame drops
+below what one seek and one decode fit inside, and extra rate stops being
+extra motion and starts being dropped frames. The clamp applies to the wire
+value in `requestTrigger` and again to a rate a `unit` has derived, since a
+long clip at a high tempo can otherwise imply a far faster rate than a value
+of 8.
 
 ### `n`
 

@@ -13,6 +13,22 @@ pub const MAX_NAME = 256;
 
 const sample_extension = ".mp4";
 
+/// How to read the `speed` value. Tidal sends this string, and the reading
+/// changes the rate completely, so a unit that is merely ignored turns a
+/// perfect sync into a video that runs at the wrong speed:
+///
+/// - `rate` (Tidal defaults here, also spelled "r" or "rate") — `speed` is a
+///   playback rate. 1 is the source frame rate, 2 is twice as fast.
+/// - `cycles` (Tidal "c") — `speed` is a cycle count the sample is stretched
+///   to fill, so `speed 2` fills half a cycle. The rate a given value implies
+///   depends on the tempo and on the clip, and only the player can compute it.
+/// - `seconds` (Tidal "s") — `speed` is a wall-clock length in seconds.
+///
+/// Anything else Tidal might send is read as `rate`: SuperDirt itself maps an
+/// unknown unit to an error, but zap silently falling back to a rate is the
+/// least damaging reading of a sender it cannot name.
+const SpeedUnit = enum { rate, cycles, seconds };
+
 /// One OSC event, in SuperDirt shape.
 ///
 /// Mirrors what a grain carries: which sample, which slice of it, which
@@ -46,6 +62,16 @@ const TriggerState = struct {
     /// fast: it asks for no movement at all, so the worker holds the frame it
     /// landed on instead of dividing by it.
     speed: f64 = 1,
+
+    /// How `speed` should be read. Defaults to a rate, which is what every
+    /// event without a `unit` key gets.
+    unit: SpeedUnit = .rate,
+
+    /// Tempo in cycles per second, straight from Tidal's `cps`, which every
+    /// `/play` event carries. Only meaningful when `unit` is `cycles`; the
+    /// effective rate is then `speed * cps` scaled by the clip, which is why
+    /// it cannot be resolved until the clip is known.
+    cps: f64 = 0,
 };
 
 const CommandState = struct {
@@ -180,6 +206,8 @@ pub const Player = struct {
         n: ?f64,
         duration: f64,
         speed: f64,
+        unit: []const u8,
+        cps: f64,
     ) void {
         if (name.len >= MAX_NAME) {
             std.log.warn("s: name too long ({d} bytes); ignored", .{name.len});
@@ -219,10 +247,17 @@ pub const Player = struct {
         // Only the sign and magnitude matter; the magnitude is clamped so an
         // absurd rate cannot make the pacing deadline wrap around.
         self.command.trigger.speed = std.math.clamp(speed, -max_speed, max_speed);
+        self.command.trigger.unit = if (std.mem.eql(u8, unit, "c"))
+            .cycles
+        else if (std.mem.eql(u8, unit, "s"))
+            .seconds
+        else
+            .rate;
+        self.command.trigger.cps = cps;
         self.command.trigger.generation += 1;
 
         std.log.info(
-            "TRIGGER #{d} s={s} begin={d:.4} end={d:.4} n={d} duration={d:.3} speed={d:.3}",
+            "TRIGGER #{d} s={s} begin={d:.4} end={d:.4} n={d} duration={d:.3} speed={d:.3} unit={s} cps={d:.4}",
             .{
                 self.command.trigger.generation,
                 if (name.len > 0) name else "",
@@ -231,6 +266,8 @@ pub const Player = struct {
                 self.command.trigger.n,
                 self.command.trigger.duration,
                 self.command.trigger.speed,
+                unit,
+                self.command.trigger.cps,
             },
         );
     }
@@ -593,6 +630,47 @@ pub const Player = struct {
                     continue;
                 };
 
+                // A cycle-relative speed is not a rate until the clip and the
+                // tempo exist, which is why it is resolved here and not in
+                // requestTrigger. Tidal's reading: "speed 2 means samples will
+                // be stretched to fill half a cycle", i.e. a speed of n fills
+                // 1/n cycles. Fill time is (1/speed)/cps seconds, so the rate
+                // the clip must be played at to fill that window is
+                //
+                //     rate = duration_seconds / ((1 / speed) / cps)
+                //          = duration_seconds * speed * cps
+                //
+                // Once the rate is right, a slice of the clip occupies exactly
+                // its wall-clock budget, and the pattern and the picture stay
+                // in step without any extra synchronization. The sign tags
+                // along unchanged because duration and cps are positive, so
+                // reverse still reverses.
+                //
+                // A rate that unit c or s derives is clamped here in the same
+                // way the wire value was in requestTrigger: a long clip at a
+                // high tempo can otherwise imply a rate far past `max_speed`.
+                // The `rate` unit never reaches this code, since the wire
+                // value was already clamped before being stored.
+                if (t.unit == .cycles) {
+                    self.speed = std.math.clamp(
+                        target.duration_seconds * self.speed * t.cps,
+                        -max_speed,
+                        max_speed,
+                    );
+                } else if (t.unit == .seconds) {
+                    if (self.speed == 0) {
+                        // An empty window is the speed-0 hold, not an
+                        // unbounded rate; keep the degenerate case intact.
+                        self.speed = 0;
+                    } else {
+                        self.speed = std.math.clamp(
+                            target.duration_seconds / self.speed,
+                            -max_speed,
+                            max_speed,
+                        );
+                    }
+                }
+
                 const reversing = t.speed < 0;
 
                 // A negative speed swaps the two ends, exactly as SuperDirt
@@ -664,7 +742,7 @@ pub const Player = struct {
                         meta.position_seconds,
                         target.duration_seconds,
                         meta.pts,
-                        t.speed,
+                        self.speed,
                         @as(f64, @floatFromInt(util.nowNs(self.io) - start_ns)) /
                             1_000_000.0,
                     },

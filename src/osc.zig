@@ -210,6 +210,10 @@ pub const OscServer = struct {
         var delta: ?f64 = null;
         var legato: ?f64 = null;
         var speed: ?f64 = null;
+        var unit: []const u8 = "r";
+        // `cps` is always on the wire (`/play` events carry it) and is never
+        // zero, so it is read as-is instead of defaulted.
+        var cps: f64 = undefined;
 
         var i: usize = 0;
         while (i < arg_tags.len) : (i += 2) {
@@ -220,7 +224,11 @@ pub const OscServer = struct {
             switch (arg_tags[i + 1]) {
                 's' => {
                     const value = try readOscString(packet, pos);
-                    if (std.mem.eql(u8, key, "s")) name = value;
+                    if (std.mem.eql(u8, key, "s")) {
+                        name = value;
+                    } else if (std.mem.eql(u8, key, "unit")) {
+                        unit = value;
+                    }
                 },
                 'i' => {
                     _ = try readI32(packet, pos);
@@ -243,6 +251,8 @@ pub const OscServer = struct {
                         legato = value;
                     } else if (std.mem.eql(u8, key, "speed")) {
                         speed = value;
+                    } else if (std.mem.eql(u8, key, "cps")) {
+                        cps = value;
                     }
                 },
                 'h' => _ = try readI64(packet, pos),
@@ -278,6 +288,8 @@ pub const OscServer = struct {
                 n orelse 0,
                 duration,
                 1.0,
+                unit,
+                cps,
             );
             return;
         }
@@ -289,6 +301,8 @@ pub const OscServer = struct {
             n orelse 0,
             duration,
             requested_speed,
+            unit,
+            cps,
         );
     }
 };
