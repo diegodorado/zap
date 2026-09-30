@@ -173,12 +173,20 @@ echo
 # Output
 # --------------------------------------------------------------------
 
-DIR="$(dirname "$INPUT")"
-NAME="$(basename "$INPUT")"
-STEM="${NAME%.*}"
+# Each part is named after the WAV it was cut for, next to it, so the two
+# stay coupled and can be renamed or deleted as a pair. ffmpeg's -y
+# overwrites whatever is already there.
+abspath() {
+  (cd "$(dirname "$1")" && printf '%s/%s\n' "$PWD" "$(basename "$1")")
+}
 
-OUTPUT_DIR="$DIR/${STEM}-parts"
-mkdir -p "$OUTPUT_DIR"
+INPUT_ABS="$(abspath "$INPUT")"
+
+for CANDIDATE in "${WAV_FILES[@]}"; do
+  if [[ "$(abspath "${CANDIDATE%.*}.mp4")" == "$INPUT_ABS" ]]; then
+    die "${CANDIDATE##*/} would overwrite the input video: $INPUT"
+  fi
+done
 
 # --------------------------------------------------------------------
 # Encode pieces
@@ -203,7 +211,7 @@ for ((i = 0; i < ${#WAV_FILES[@]}; i++)); do
   )"
 
   PART=$((i + 1))
-  OUTPUT="$OUTPUT_DIR/${STEM}-${PART}.mp4"
+  OUTPUT="${WAV_FILES[$i]%.*}.mp4"
 
   echo "==> [$PART/${#WAV_FILES[@]}] $WAV_NAME"
   echo "    samples:  $START_SAMPLE -> $END_SAMPLE"
@@ -230,5 +238,4 @@ for ((i = 0; i < ${#WAV_FILES[@]}; i++)); do
 done
 
 echo "done:"
-echo "  output: $OUTPUT_DIR"
-echo "  parts:  ${#WAV_FILES[@]}"
+echo "  parts: ${#WAV_FILES[@]} (next to the WAVs)"
