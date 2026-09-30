@@ -8,7 +8,7 @@ VIDEO_HEIGHT=1080
 
 usage() {
   echo "usage:"
-  echo "  $0 INPUT.mp4 WAV_DIRECTORY"
+  echo "  ${0##*/} INPUT.mp4 WAV_DIRECTORY"
   exit 1
 }
 

@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-URL="$1"
+usage() {
+  echo "usage:"
+  echo "  ${0##*/} URL"
+  exit 1
+}
 
-if [[ ! "$URL" ]]; then
-  die "$URL not found"
+if (($# != 1)); then
+  usage
 fi
+
+URL="$1"
 
 yt-dlp \
   -f "bv*[height<=1080][vcodec^=avc1][ext=mp4]+ba[acodec^=mp4a][ext=m4a]" \

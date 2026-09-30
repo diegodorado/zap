@@ -5,7 +5,7 @@ SAMPLE_RATE=48000
 
 usage() {
   echo "usage:"
-  echo "  $0 INPUT.mp4"
+  echo "  ${0##*/} INPUT.mp4"
   exit 1
 }
 

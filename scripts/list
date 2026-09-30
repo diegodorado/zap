@@ -1,7 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-for f in *.mp4; do
+DIR="${1:-.}"
+
+if [[ ! -d "$DIR" ]]; then
+  echo "error: $DIR is not a directory" >&2
+  exit 1
+fi
+
+# Without nullglob an empty directory yields the literal string "*.mp4" and
+# ffprobe is handed a path that does not exist.
+shopt -s nullglob
+
+files=("$DIR"/*.mp4)
+
+if ((${#files[@]} == 0)); then
+  echo "no mp4 files in $DIR"
+  exit 0
+fi
+
+for f in "${files[@]}"; do
   printf '%-45s ' "$f"
   ffprobe -v error \
     -show_entries stream=codec_type,codec_name,width,height,avg_frame_rate,duration,bit_rate,nb_frames,sample_rate,channels \
