@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo "usage:"
+  echo "  ${0##*/} [--dry-run] PREFIX [FOLDER]"
+  echo
+  echo "Renames every file in FOLDER (default: .) to PREFIX.NNN.ext, numbered"
+  echo "in natural order so that a plain sort gives 001, 002, 010 and not"
+  echo "1, 10, 2. Each extension is numbered independently, so one folder can"
+  echo "hold wavs, mp4s and anything else without them interleaving."
+  exit 1
+}
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+DRY_RUN=false
+
+if [[ "${1-}" == "--dry-run" ]]; then
+  DRY_RUN=true
+  shift
+fi
+
+if (($# < 1 || $# > 2)); then
+  usage
+fi
+
+PREFIX="$1"
+DIR="${2:-.}"
+
+if [[ ! -d "$DIR" ]]; then
+  die "$DIR is not a directory"
+fi
+
+# A prefix is a name, not a path. "$DIR/$PREFIX" happens to stay inside DIR
+# even when PREFIX starts with a slash, but the result is a confusing name
+# rather than an escape, and that is not worth relying on.
+if [[ -z "$PREFIX" || "$PREFIX" == -* || "$PREFIX" == */* ]]; then
+  die "invalid prefix: '$PREFIX'"
+fi
+
+# Without -V a plain sort orders asdf-10 before asdf-2, and no amount of
+# index padding downstream can repair an ordering that was decided here.
+if ! printf 'a2\na10\n' | sort -V >/dev/null 2>&1; then
+  die "sort -V is required (BSD or GNU version sort)"
+fi
+
+# --------------------------------------------------------------------
+# Collect
+# --------------------------------------------------------------------
+
+# Dotfiles are skipped: a stray .DS_Store must not be renumbered into the
+# collection as PREFIX.001.something.
+
+files=()
+
+while IFS= read -r f; do
+  files+=("$f")
+done < <(find "$DIR" -maxdepth 1 -type f ! -name '.*')
+
+if ((${#files[@]} == 0)); then
+  die "no files in $DIR"
+fi
+
+# The grouping key is the extension, lowercased. Case is normalized for
+# grouping only: on a case-insensitive filesystem a.WAV and b.wav must land
+# in one sequence, or both would claim PREFIX.001 and collide.
+ext_key() {
+  local base="${1##*/}"
+
+  if [[ "$base" == *.* ]]; then
+    printf '%s' "${base##*.}" | tr '[:upper:]' '[:lower:]'
+  fi
+}
+
+keys=()
+
+for f in "${files[@]}"; do
+  keys+=("$(ext_key "$f")")
+done
+
+groups=()
+
+while IFS= read -r k; do
+  groups+=("$k")
+done < <(printf '%s\n' "${keys[@]}" | LC_ALL=C sort -u)
+
+# --------------------------------------------------------------------
+# Plan
+# --------------------------------------------------------------------
+
+srcs=()
+dsts=()
+labels=()
+
+for key in "${groups[@]}"; do
+  members=()
+
+  for i in "${!files[@]}"; do
+    if [[ "$(ext_key "${files[$i]}")" == "$key" ]]; then
+      members+=("${files[$i]}")
+    fi
+  done
+
+  sorted=()
+
+  while IFS= read -r line; do
+    sorted+=("$line")
+  done < <(printf '%s\n' "${members[@]}" | LC_ALL=C sort -V)
+
+  total=${#sorted[@]}
+
+  # Three digits, widened only if a group holds more than 999 files: a
+  # mixed-width set (999, 1000) does not sort, since "1000" precedes "999".
+  width=${#total}
+
+  if ((width < 3)); then
+    width=3
+  fi
+
+  if [[ -z "$key" ]]; then
+    label="(no extension)"
+  else
+    label=".$key"
+  fi
+
+  if ((width > 3)); then
+    echo "==> $label: $total files, widening index to $width digits"
+  fi
+
+  for ((i = 0; i < total; i++)); do
+    base="${sorted[$i]##*/}"
+
+    if [[ "$base" == *.* ]]; then
+      ext=".${base##*.}"
+    else
+      ext=""
+    fi
+
+    printf -v dst '%s/%s.%0*d%s' "$DIR" "$PREFIX" "$width" "$((i + 1))" "$ext"
+
+    srcs+=("${sorted[$i]}")
+    dsts+=("$dst")
+    labels+=("$label")
+  done
+done
+
+echo "==> ${#srcs[@]} files in $DIR"
+echo
+
+for i in "${!srcs[@]}"; do
+  if ((i == 0)) || [[ "${labels[$i]}" != "${labels[$((i - 1))]}" ]]; then
+    printf '\n  [%s]\n' "${labels[$i]}"
+  fi
+
+  printf '  %-44s -> %s\n' "${srcs[$i]##*/}" "${dsts[$i]##*/}"
+done
+
+echo
+
+if [[ "$DRY_RUN" == true ]]; then
+  echo "dry run: nothing renamed"
+  exit 0
+fi
+
+# --------------------------------------------------------------------
+# Rename
+# --------------------------------------------------------------------
+
+# Two passes through unique temporary names. A destination can already be
+# taken by a file that is itself in the set: if PREFIX.001.wav exists and
+# does not sort first, it owns that name until it has been moved aside.
+# Renaming straight to the destination would clobber it.
+
+total=${#srcs[@]}
+tmps=()
+
+for ((i = 0; i < total; i++)); do
+  base="${srcs[$i]##*/}"
+
+  if [[ "$base" == *.* ]]; then
+    ext=".${base##*.}"
+  else
+    ext=""
+  fi
+
+  # The extension survives the temporary name, so an interrupted run
+  # leaves files that still look like the media they are.
+  tmp="$DIR/.normalize.$$.${i}${ext}"
+
+  if ! mv "${srcs[$i]}" "$tmp"; then
+    for ((j = 0; j < ${#tmps[@]}; j++)); do
+      mv "${tmps[$j]}" "${srcs[$j]}" || true
+    done
+    die "rename failed on ${srcs[$i]}, restored ${#tmps[@]} file(s)"
+  fi
+
+  tmps+=("$tmp")
+done
+
+for ((i = 0; i < total; i++)); do
+  if ! mv "${tmps[$i]}" "${dsts[$i]}"; then
+    die "could not place ${tmps[$i]} as ${dsts[$i]}"
+  fi
+done
+
+echo "done:"
+echo "  files: $total"
+echo "  kinds: ${#groups[@]}"
