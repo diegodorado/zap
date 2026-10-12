@@ -22,9 +22,94 @@ pub const Renderer = struct {
     /// "never draw an unwritten texture" is a property of this function alone.
     has_frame: [player_mod.MAX_ORBITS]bool = @splat(false),
 
-    /// `borderless` drops the window decorations, which is what a video wall
-    /// or a projector feed wants; the window keeps its size and position and
-    /// stays resizable, it just has no title bar or frame.
+    /// The default windowed size for a plain launch.
+    const default_width = 1280;
+    const default_height = 720;
+
+    fn createWindow(borderless: bool) ?*c.SDL_Window {
+        if (!borderless) {
+            return c.SDL_CreateWindow(
+                "zap",
+                default_width,
+                default_height,
+                c.SDL_WINDOW_RESIZABLE,
+            );
+        }
+
+        // Cover the display the cursor is on, so a multi-monitor setup opens
+        // on the monitor you are looking at; fall back to the primary one.
+        var mouse_x: f32 = 0;
+        var mouse_y: f32 = 0;
+        _ = c.SDL_GetGlobalMouseState(&mouse_x, &mouse_y);
+
+        const at_cursor = c.SDL_GetDisplayForPoint(&.{
+            .x = @intFromFloat(mouse_x),
+            .y = @intFromFloat(mouse_y),
+        });
+        const display = if (at_cursor != 0) at_cursor else c.SDL_GetPrimaryDisplay();
+
+        var bounds: c.SDL_Rect = undefined;
+        if (!c.SDL_GetDisplayBounds(display, &bounds)) {
+            log.warn(
+                "could not get display bounds: {s}; borderless window opens at its default size",
+                .{c.SDL_GetError()},
+            );
+            return c.SDL_CreateWindow(
+                "zap",
+                default_width,
+                default_height,
+                c.SDL_WINDOW_RESIZABLE | c.SDL_WINDOW_BORDERLESS,
+            );
+        }
+
+        const props = c.SDL_CreateProperties();
+        defer c.SDL_DestroyProperties(props);
+
+        _ = c.SDL_SetStringProperty(
+            props,
+            c.SDL_PROP_WINDOW_CREATE_TITLE_STRING,
+            "zap",
+        );
+        _ = c.SDL_SetNumberProperty(
+            props,
+            c.SDL_PROP_WINDOW_CREATE_X_NUMBER,
+            bounds.x,
+        );
+        _ = c.SDL_SetNumberProperty(
+            props,
+            c.SDL_PROP_WINDOW_CREATE_Y_NUMBER,
+            bounds.y,
+        );
+        _ = c.SDL_SetNumberProperty(
+            props,
+            c.SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER,
+            bounds.w,
+        );
+        _ = c.SDL_SetNumberProperty(
+            props,
+            c.SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER,
+            bounds.h,
+        );
+        _ = c.SDL_SetBooleanProperty(
+            props,
+            c.SDL_PROP_WINDOW_CREATE_BORDERLESS_BOOLEAN,
+            true,
+        );
+        _ = c.SDL_SetBooleanProperty(
+            props,
+            c.SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN,
+            true,
+        );
+
+        return c.SDL_CreateWindowWithProperties(props);
+    }
+
+    /// `borderless` opens a decoration-free window that covers the whole
+    /// display it appears on: a video wall or projector feed wants the screen
+    /// filled edge to edge. It cannot stay a small borderless window waiting
+    /// for its tiling window manager to fill it, because macOS gives a
+    /// borderless window no fullscreen button and a tiler like AeroSpace
+    /// floats such windows instead of managing their size.
     pub fn init(borderless: bool) !Renderer {
         if (!c.SDL_Init(c.SDL_INIT_VIDEO)) {
             log.err("SDL_Init failed: {s}", .{c.SDL_GetError()});
@@ -33,18 +118,8 @@ pub const Renderer = struct {
 
         errdefer c.SDL_Quit();
 
-        var window_flags: c.SDL_WindowFlags = c.SDL_WINDOW_RESIZABLE;
-        if (borderless) {
-            window_flags |= c.SDL_WINDOW_BORDERLESS;
-        }
-
-        const window = c.SDL_CreateWindow(
-            "zap",
-            1280,
-            720,
-            window_flags,
-        ) orelse {
-            log.err("SDL_CreateWindow failed: {s}", .{c.SDL_GetError()});
+        const window = createWindow(borderless) orelse {
+            log.err("SDL window creation failed: {s}", .{c.SDL_GetError()});
             return error.SdlWindowFailed;
         };
 
