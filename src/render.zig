@@ -26,8 +26,8 @@ pub const Renderer = struct {
     const default_width = 1280;
     const default_height = 720;
 
-    fn createWindow(borderless: bool) ?*c.SDL_Window {
-        if (!borderless) {
+    fn createWindow(fullscreen: bool) ?*c.SDL_Window {
+        if (!fullscreen) {
             return c.SDL_CreateWindow(
                 "zap",
                 default_width,
@@ -51,7 +51,7 @@ pub const Renderer = struct {
         var bounds: c.SDL_Rect = undefined;
         if (!c.SDL_GetDisplayBounds(display, &bounds)) {
             log.warn(
-                "could not get display bounds: {s}; borderless window opens at its default size",
+                "could not get display bounds: {s}; fullscreen window opens at its default size",
                 .{c.SDL_GetError()},
             );
             return c.SDL_CreateWindow(
@@ -104,13 +104,13 @@ pub const Renderer = struct {
         return c.SDL_CreateWindowWithProperties(props);
     }
 
-    /// `borderless` opens a decoration-free window that covers the whole
-    /// display it appears on: a video wall or projector feed wants the screen
-    /// filled edge to edge. It cannot stay a small borderless window waiting
-    /// for its tiling window manager to fill it, because macOS gives a
-    /// borderless window no fullscreen button and a tiler like AeroSpace
-    /// floats such windows instead of managing their size.
-    pub fn init(borderless: bool) !Renderer {
+    /// `fullscreen` opens a borderless window that covers the whole display it
+    /// appears on: a video wall or projector feed wants the screen filled edge
+    /// to edge. It cannot stay a small borderless window waiting for its
+    /// tiling window manager to fill it, because macOS gives a borderless
+    /// window no fullscreen button and a tiler like AeroSpace floats such
+    /// windows instead of managing their size.
+    pub fn init(fullscreen: bool) !Renderer {
         if (!c.SDL_Init(c.SDL_INIT_VIDEO)) {
             log.err("SDL_Init failed: {s}", .{c.SDL_GetError()});
             return error.SdlInitFailed;
@@ -118,7 +118,7 @@ pub const Renderer = struct {
 
         errdefer c.SDL_Quit();
 
-        const window = createWindow(borderless) orelse {
+        const window = createWindow(fullscreen) orelse {
             log.err("SDL window creation failed: {s}", .{c.SDL_GetError()});
             return error.SdlWindowFailed;
         };

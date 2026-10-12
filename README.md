@@ -13,7 +13,7 @@ This is intentionally NOT a general-purpose media player.
 
 - Zig implementation
 - SDL3 window and rendering
-- optional borderless window filling the display (`--borderless`)
+- optional borderless fullscreen window (`--fullscreen`)
 - OSC UDP receiver
 - `/play` single-event trigger: SuperDirt key/value pairs, any order
 - parallel playback: up to 8 independent orbits, each its own worker thread
@@ -140,13 +140,13 @@ To play samples, point zap at a media directory:
 The media directory is mandatory and has no default, because without it
 there is nothing for a `/play` to name.
 
-Pass `--borderless` for a decoration-free window that covers the whole
+Pass `--fullscreen` for a borderless window that covers the whole
 display it opens on, sized and positioned to the monitor the cursor is on.
 A borderless macOS window has no fullscreen button, and a tiling manager
 like AeroSpace floats windows without that button instead of filling them,
 so zap covers the display itself at launch rather than waiting to be tiled:
 
-    ./zig-out/bin/zap --borderless /Users/me/my-media
+    ./zig-out/bin/zap --fullscreen /Users/me/my-media
 
 ---
 

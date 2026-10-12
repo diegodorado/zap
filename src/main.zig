@@ -7,7 +7,7 @@ const benchmark = @import("benchmark.zig");
 
 const log = std.log.scoped(.main);
 
-const usage = "usage: zap [--benchmark] [--borderless] <media-dir>";
+const usage = "usage: zap [--benchmark] [--fullscreen] <media-dir>";
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -18,7 +18,7 @@ pub fn main(init: std.process.Init) !void {
     var args = init.minimal.args.iterate();
 
     var benchmark_mode = false;
-    var borderless = false;
+    var fullscreen = false;
     var media_dir: ?[]const u8 = null;
 
     _ = args.next(); // executable name
@@ -29,8 +29,8 @@ pub fn main(init: std.process.Init) !void {
             continue;
         }
 
-        if (std.mem.eql(u8, arg, "--borderless")) {
-            borderless = true;
+        if (std.mem.eql(u8, arg, "--fullscreen")) {
+            fullscreen = true;
             continue;
         }
 
@@ -82,7 +82,7 @@ pub fn main(init: std.process.Init) !void {
 
     try player.start();
 
-    var renderer = try Renderer.init(borderless);
+    var renderer = try Renderer.init(fullscreen);
     defer renderer.deinit();
 
     var osc = OscServer.init(
