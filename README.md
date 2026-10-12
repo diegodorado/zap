@@ -15,10 +15,14 @@ This is intentionally NOT a general-purpose media player.
 - SDL3 window and rendering
 - OSC UDP receiver
 - `/play` single-event trigger: SuperDirt key/value pairs, any order
+- parallel playback: up to 8 independent orbits, each its own worker thread
+  and decoder
+- per-orbit regions: `x`, `y`, `size` place each voice's picture on the screen,
+  so a video plays only inside its rectangle
 - collection-based sample resolution: `s` names a directory, `n` names a
   clip inside it
-- a named clip is opened once and reused by later triggers
-- normalized slice playback (`begin` .. `end`), black when a slice ends
+- a named clip is opened once per orbit and reused by later triggers
+- normalized slice playback (`begin` .. `end`), black where a slice ends
 - `speed` playback rate, including negative values for reverse playback
 - the window is black before the first frame, never a placeholder
 - wall-clock `duration` cutoff
@@ -243,6 +247,10 @@ zap reads these keys:
 | `cps`    | `f`   | `0`     | tempo in cycles/sec, needed only for `unit c`     |
 | `delta`  | `f`   | `0`     | event length in seconds                    |
 | `legato` | `f`   | `1`     | length multiplier                          |
+| `orbit`  | `i`   | `0`     | voice index in `0..7`; out of range is dropped |
+| `x`      | `f`   | `0`     | region left edge, normalized (top-left origin) |
+| `y`      | `f`   | `0`     | region top edge, normalized                |
+| `size`   | `f`   | `1`     | region scale; 16:9 aspect is preserved     |
 
 Every other key Tidal sends (`midichan`, `note`, `velocity`, `cc*`,
 `octave`, ...) is fully read and thrown away. That matters: skipping the
@@ -272,6 +280,41 @@ is recognized and skipped, using the OSC 1.0 test for an "immediate"
 timetag: top bit of the seconds word clear, top bit of the fraction word
 set. A packet without one parses identically.
 
+### Orbits and regions
+
+`orbit` is the voice that plays the event, in SuperDirt terms. zap runs up
+to **8** orbits (`0..7`), each its own worker thread, decoder, and shared
+frame mailbox. Orbits play the same or different clips at the same time,
+each at its own position:
+
+    /play s "s" s "bd"  s "orbit" i 1
+    /play s "s" s "hhat" s "orbit" i 2
+
+An `orbit` outside `0..7` does not exist, so the event is dropped before it
+can change any state and the screen keeps its picture exactly as it was:
+
+    warning: orbit 9 is out of range [0..7]; event ignored
+
+`orbit` is an integer, never a float. Audio lives in SuperDirt; each video
+orbit maps one-to-one onto a SuperDirt audio orbit, which is what keeps a
+pattern's picture and its sound separate.
+
+`x`, `y` and `size` place the orbit's picture on the 1920x1080 logical
+canvas. `x`/`y` are the top-left corner in normalized coordinates and
+`size` scales the whole frame, keeping the 16:9 aspect:
+
+    /play s "s" s "bd" s "orbit" i 1 s "x" f 0.5 s "y" f 0.5 s "size" f 0.25
+
+places a quarter-height, 16:9 window whose top-left is at the center of the
+screen. The region is clamped to stay on screen (`x`/`y` first shrink to
+`0..1 - size`, after `size` itself is clamped to `0..1`), so a region never
+hangs off the edge.
+
+Regions are **sticky per orbit**: they only move when an event carries
+`x`/`y`/`size`, so a stream that positions itself once and then retriggers
+with `s` alone keeps its place. When `orbit` is omitted, the event plays on
+orbit 0 at full screen, so a single-clip zap behaves exactly as before.
+
 ### Resolving `s`
 
 `s` names a **collection**, and a collection is a directory of clips inside
@@ -292,9 +335,11 @@ that collection. `s` is only ever a collection name, never a path: a value
 containing a `/` does not escape the media directory, it simply fails to
 match a collection.
 
-Omitting `s` reuses the clip that is already loaded. A clip is opened once;
-later events resolving to the same file reuse the open decoder instead of
-re-reading it.
+Omitting `s` reuses the clip that orbit already has loaded. A clip is opened
+once **per orbit**; later events to the same orbit resolving to the same file
+reuse the open decoder instead of re-reading it. The reuse cache is never
+global: a global decoder can only serve one playhead, and two orbits may be
+playing the same clip at different positions at the same time.
 
 The scan happens once at startup, so a pattern firing many events a second
 never pays for a directory walk, and a broken media directory is reported
@@ -315,8 +360,9 @@ Both are normalized positions in `0..1` mapped onto that clip's stream
 duration. They are not frame numbers.
 
 `end` defaults to `1`, so an event with no `end` plays to the end of the
-clip. Once the slice reaches `end` the window goes **black** and stays there
-until the next event. There is no auto-loop, because looping on its own would
+clip. Once a slice reaches `end`, that orbit's region goes **black** while
+every other orbit keeps its own picture, and it stays black until the next
+event for that orbit. There is no auto-loop, because looping on its own would
 fight the pattern that drives zap.
 
 A frozen last frame is not held on screen indefinitely. A still that outlives
@@ -333,23 +379,24 @@ arrives first wins.
 
 #### The blackout grace period
 
-When a slice ends, zap holds the last frame for **150 ms** before going black,
-and any event arriving inside that window cancels the blackout. This exists
+When a slice ends, zap holds the last frame in that orbit's region for
+**150 ms** before going black, and any event arriving inside that window
+cancels the blackout. This exists
 because an event always costs a seek: `begin` is a normalized position and
 `begin`/`end` are only frame-exact when the source is all-intra (GOP=1), so a
 larger seek means more decode time before the first frame of the new slice
-reaches the window.
+reaches the region.
 
 Without the grace, a dense pattern blacked out once per event, because the
-slice finished, the window went black, and then the next event's seek took
+slice finished, the region went black, and then the next event's seek took
 long enough to miss the next display refresh. Measured over a 30-event pattern
 with 5-15 ms seeks, the pre-fix build presented **12 black frames**; with the
 grace it presents none, and the only blackout left is the final one after the
 pattern actually stops.
 
 So the rule reads: a clip that ends and is followed by more events never
-blanks, and a clip that ends because the performance ended does. The window is
-black at startup, before any clip has played.
+blanks, and a clip that ends because the performance ended does. The regions
+are black at startup, before any clip has played.
 
 #### Reverse playback and `begin` / `end`
 
@@ -735,15 +782,15 @@ implemented.
 
 Decoded H.264 frames are currently expected to arrive as YUV420P.
 
-The renderer uses:
+The renderer uses one texture per orbit:
 
-    AVFrame Y/U/V
+    AVFrame Y/U/V   (orbit 0)
           |
           v
     small CPU frame mailbox
           |
           v
-    SDL IYUV texture
+    SDL IYUV texture        ...one per orbit
           |
           v
     SDL renderer
@@ -751,9 +798,12 @@ The renderer uses:
           v
     display
 
-The mailbox avoids allocating a new 1080p buffer for every frame, and every
-source is 1920x1080, so the SDL texture is allocated once at startup and
-never resized.
+The mailbox avoids allocating a new 1080p buffer for every frame, every
+source is 1920x1080, and every orbit's SDL texture is allocated once at
+startup and never resized. The backbuffer is cleared once per refresh and
+each showing orbit copies its texture into its region's rectangle; an orbit
+that ended simply stops drawing, so exactly its region goes black without
+erasing any other orbit's picture.
 
 Presentation is vsync-locked: `SDL_SetRenderVSync(renderer, 1)`, and the
 main loop has no sleep of its own, because `SDL_RenderPresent` already

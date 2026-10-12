@@ -214,6 +214,14 @@ pub const OscServer = struct {
         // `cps` is always on the wire (`/play` events carry it) and is never
         // zero, so it is read as-is instead of defaulted.
         var cps: f64 = undefined;
+        // `orbit` is an int32, exactly as SuperDirt sends it. It selects which
+        // of zap's voices this event drives; out of range it is refused.
+        var orbit: i32 = 0;
+        // `x`/`y`/`size` are optional, so they stay optional until the player
+        // decides whether to move this orbit's region.
+        var x: ?f64 = null;
+        var y: ?f64 = null;
+        var size: ?f64 = null;
 
         var i: usize = 0;
         while (i < arg_tags.len) : (i += 2) {
@@ -231,7 +239,10 @@ pub const OscServer = struct {
                     }
                 },
                 'i' => {
-                    _ = try readI32(packet, pos);
+                    const value = try readI32(packet, pos);
+                    if (std.mem.eql(u8, key, "orbit")) {
+                        orbit = value;
+                    }
                 },
                 'f', 'd' => {
                     const value: f64 = switch (arg_tags[i + 1]) {
@@ -253,6 +264,12 @@ pub const OscServer = struct {
                         speed = value;
                     } else if (std.mem.eql(u8, key, "cps")) {
                         cps = value;
+                    } else if (std.mem.eql(u8, key, "x")) {
+                        x = value;
+                    } else if (std.mem.eql(u8, key, "y")) {
+                        y = value;
+                    } else if (std.mem.eql(u8, key, "size")) {
+                        size = value;
                     }
                 },
                 'h' => _ = try readI64(packet, pos),
@@ -290,6 +307,10 @@ pub const OscServer = struct {
                 1.0,
                 unit,
                 cps,
+                orbit,
+                x,
+                y,
+                size,
             );
             return;
         }
@@ -303,6 +324,10 @@ pub const OscServer = struct {
             requested_speed,
             unit,
             cps,
+            orbit,
+            x,
+            y,
+            size,
         );
     }
 };

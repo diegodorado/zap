@@ -1,7 +1,8 @@
 const std = @import("std");
 const c = @import("c");
 
-const Player = @import("player.zig").Player;
+const player_mod = @import("player.zig");
+const Player = player_mod.Player;
 const video = @import("video.zig");
 
 const log = std.log.scoped(.render);
@@ -9,15 +10,17 @@ const log = std.log.scoped(.render);
 pub const Renderer = struct {
     window: *c.SDL_Window,
     renderer: *c.SDL_Renderer,
-    texture: *c.SDL_Texture,
 
-    /// Whether the texture has ever received a frame. A freshly created
-    /// streaming texture holds uninitialized memory, and drawing that is what
-    /// showed a green window between launch and the first decoded frame. It
-    /// is tracked here so "never draw an unwritten texture" is a property of
-    /// this function alone, instead of something that depends on the worker
-    /// having published a frame first.
-    has_frame: bool = false,
+    /// One texture per orbit, the companion of the per-orbit mailbox: every
+    /// clip is 1920x1080, so a texture is allocated once per voice at startup
+    /// and never resized.
+    textures: [player_mod.MAX_ORBITS]*c.SDL_Texture,
+
+    /// Whether each orbit's texture has ever received a frame. A freshly
+    /// created streaming texture holds uninitialized memory, and drawing that
+    /// is what showed green before the first decoded frame. Tracked here so
+    /// "never draw an unwritten texture" is a property of this function alone.
+    has_frame: [player_mod.MAX_ORBITS]bool = @splat(false),
 
     pub fn init() !Renderer {
         if (!c.SDL_Init(c.SDL_INIT_VIDEO)) {
@@ -65,8 +68,10 @@ pub const Renderer = struct {
         // Fixed logical size, so a resized window letterboxes instead of
         // stretching. The window is resizable and the default 1280x720 is
         // already 16:9, but dragging the window to any other shape must not
-        // distort the picture, so the scale factor is SDL's job, not a dst
-        // rect recomputed from the source on every clip change.
+        // distort the picture, so the scale factor is SDL's job, not dst rects
+        // recomputed from the source on every clip change. Orbit regions live
+        // in this same logical coordinate space, so a 1920x1080 coordinate
+        // maps one-to-one onto the letterboxed canvas.
         if (!c.SDL_SetRenderLogicalPresentation(
             renderer,
             video.frame_width,
@@ -80,19 +85,25 @@ pub const Renderer = struct {
             );
         }
 
-        // Every source is 1920x1080, so the texture is allocated once at
-        // startup and never resized. With logical presentation handling the
-        // window fit, a null source rect and a null destination rect are
-        // correct and there is no per-frame rect math left to get wrong.
-        const texture = c.SDL_CreateTexture(
-            renderer,
-            c.SDL_PIXELFORMAT_IYUV,
-            c.SDL_TEXTUREACCESS_STREAMING,
-            @intCast(video.frame_width),
-            @intCast(video.frame_height),
-        ) orelse {
-            log.err("SDL_CreateTexture failed: {s}", .{c.SDL_GetError()});
-            return error.SdlTextureFailed;
+        // One streaming IYUV texture per orbit, sized for the fixed source
+        // resolution.
+        var textures: [player_mod.MAX_ORBITS]*c.SDL_Texture = undefined;
+
+        for (&textures) |*texture| {
+            texture.* = c.SDL_CreateTexture(
+                renderer,
+                c.SDL_PIXELFORMAT_IYUV,
+                c.SDL_TEXTUREACCESS_STREAMING,
+                @intCast(video.frame_width),
+                @intCast(video.frame_height),
+            ) orelse {
+                log.err("SDL_CreateTexture failed: {s}", .{c.SDL_GetError()});
+                return error.SdlTextureFailed;
+            };
+        }
+
+        errdefer for (&textures) |texture| {
+            c.SDL_DestroyTexture(texture);
         };
 
         log.info("SDL renderer initialized", .{});
@@ -100,28 +111,35 @@ pub const Renderer = struct {
         return .{
             .window = window,
             .renderer = renderer,
-            .texture = texture,
+            .textures = textures,
         };
     }
 
     pub fn deinit(self: *Renderer) void {
-        c.SDL_DestroyTexture(self.texture);
+        for (&self.textures) |texture| {
+            c.SDL_DestroyTexture(texture);
+        }
         c.SDL_DestroyRenderer(self.renderer);
         c.SDL_DestroyWindow(self.window);
         c.SDL_Quit();
     }
 
     pub fn render(self: *Renderer, player: *Player) !void {
-        // False before the first trigger and after a slice ends: the window is
-        // black then, because there is no picture rather than a stale one.
-        const live = player.showsFrame();
+        // Upload: pull this frame from each live orbit and copy it into that
+        // orbit's texture. Nothing is drawn in this pass; the draw pass below
+        // owns what lands on the backbuffer, so dropping a frame here only
+        // re-presents the previous one.
+        for (0..player_mod.MAX_ORBITS) |i| {
+            // False before this orbit's first trigger and after its slice
+            // ends: its region is black then, because there is no picture
+            // rather than a stale one.
+            if (!player.orbitShowsFrame(i)) continue;
 
-        if (live) {
-            if (player.takeLatestFrame()) |frame| {
+            if (player.takeLatestFrame(i)) |frame| {
                 defer player.releaseFrame(frame);
 
                 const ok = c.SDL_UpdateYUVTexture(
-                    self.texture,
+                    self.textures[i],
                     null,
                     frame.y.ptr,
                     frame.luma_pitch,
@@ -136,7 +154,7 @@ pub const Renderer = struct {
                     return error.SdlTextureUpdateFailed;
                 }
 
-                self.has_frame = true;
+                self.has_frame[i] = true;
             }
         }
 
@@ -145,13 +163,15 @@ pub const Renderer = struct {
         // SDL_RenderPresent, so presenting without redrawing shows an
         // undefined backbuffer. On a 30fps source with a 60Hz display that is
         // half of the refreshes, which reads as flicker even though the frame
-        // rate is correct. The texture is the durable copy, so redraw it from
-        // the texture and let it hold until the next update.
+        // rate is correct. The textures are the durable copies, so redraw from
+        // them and let the composition hold until the next update.
         //
-        // The texture is only drawn once it holds a real frame, and only while
-        // a clip is playing. Between those points the clear alone stands, which
-        // is what keeps the window black instead of green before the first
-        // decode and instead of a frozen still after a slice ends.
+        // There are no layers: the backbuffer is the full screen, one color per
+        // refresh. Each live orbit blits its texture into a rect derived from
+        // its normalized region, so the picture displayed anywhere is just the
+        // last orbit that drew there. An orbit that ends simply stops drawing,
+        // and only its region returns to black while every other region keeps
+        // redrawing from the texture that still holds its last frame.
         _ = c.SDL_SetRenderDrawColor(
             self.renderer,
             0,
@@ -162,12 +182,27 @@ pub const Renderer = struct {
 
         _ = c.SDL_RenderClear(self.renderer);
 
-        if (live and self.has_frame) {
+        const render_w: f32 = @floatFromInt(video.frame_width);
+        const render_h: f32 = @floatFromInt(video.frame_height);
+
+        for (0..player_mod.MAX_ORBITS) |i| {
+            if (!player.orbitShowsFrame(i)) continue;
+            if (!self.has_frame[i]) continue;
+
+            const region = player.orbitRegion(i);
+
+            var dst = c.SDL_FRect{
+                .x = @as(f32, @floatCast(region.x)) * render_w,
+                .y = @as(f32, @floatCast(region.y)) * render_h,
+                .w = @as(f32, @floatCast(region.size)) * render_w,
+                .h = @as(f32, @floatCast(region.size)) * render_h,
+            };
+
             _ = c.SDL_RenderTexture(
                 self.renderer,
-                self.texture,
+                self.textures[i],
                 null,
-                null,
+                &dst,
             );
         }
 

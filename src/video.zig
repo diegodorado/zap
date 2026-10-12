@@ -271,6 +271,23 @@ pub const FrameMailbox = struct {
             }
         }
     }
+
+    /// True when the renderer still holds a slot from this mailbox. A video
+    /// holding a `displaying` slot must not be closed, because the renderer is
+    /// mid-upload from the slot's planes. The worker checks this before
+    /// closing a video that an orbit has just stopped using.
+    pub fn hasDisplaying(self: *FrameMailbox) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        for (&self.slots) |*slot| {
+            if (slot.state == .displaying) {
+                return true;
+            }
+        }
+
+        return false;
+    }
 };
 
 pub const VideoFile = struct {

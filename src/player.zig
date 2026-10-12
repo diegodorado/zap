@@ -7,7 +7,17 @@ const video = @import("video.zig");
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
 
-pub const MAX_VIDEOS = 64;
+/// How many concurrent pictures zap can carry. An orbit is SuperDirt's own
+/// notion of an output voice, so a `/play` names one and zap keeps every orbit
+/// independent: its own clip, its own slice, its own screen region, its own
+/// worker.
+pub const MAX_ORBITS = 8;
+
+/// Upper bound on how many just-abandoned decoders an orbit will keep around
+/// before closing them. An orbit switching clips retires its previous decoder
+/// here; it is closed once the renderer is provably no longer using it.
+const MAX_VIDEOS_PER_ORBIT = 16;
+
 pub const MAX_PATH = 4096;
 pub const MAX_NAME = 256;
 
@@ -74,12 +84,75 @@ const TriggerState = struct {
     cps: f64 = 0,
 };
 
-const CommandState = struct {
-    load_pending: bool = false,
-    load_path: [MAX_PATH]u8 = undefined,
-    load_path_len: usize = 0,
+/// A normalized screen region. `size` is a scalar scale, so the region keeps
+/// the source's 16:9 shape: it is `size` of the width and `size` of the height
+/// of the 1920x1080 logical space. `x`/`y` are the top-left in normalized
+/// screen units. As normalized values each is clamped so the rect stays inside
+/// the screen. Defaults (0, 0, 1) are the full screen, which is what a `/play`
+/// without a region has always meant.
+const Region = struct {
+    x: f64 = 0,
+    y: f64 = 0,
+    size: f64 = 1,
+};
 
+/// Mutable per-orbit state. The fields split along the same fault lines as the
+/// original global state did:
+///
+/// - the OSC thread writes `trigger` and `region` under the player mutex;
+/// - the orbit's worker reads `trigger` under the mutex and owns everything
+///   else, including which decoder is `current_video`;
+/// - the renderer reads `showing` (atomic) and `region`/`current_video`
+///   (under the player mutex) to compose the picture.
+const Orbit = struct {
+    index: usize = undefined,
+
+    /// Bumped on every event directed at this orbit. The orbit's worker
+    /// applies a trigger only once, and only when it can see the whole struct,
+    /// so the parameters of one event can never be applied piecemeal.
     trigger: TriggerState = .{},
+    applied_trigger_generation: u64 = 0,
+
+    /// Sticky: an event updates a field only when the event carried it, so a
+    /// sparse pattern does not yank an orbit back to full screen.
+    region: Region = .{},
+
+    /// Whether this orbit's picture should be on screen right now. The render
+    /// loop has to know the difference between "waiting for the next frame of
+    /// a playing slice" and "this orbit's slice is over, show nothing in its
+    /// region". The mailbox cannot answer that: its last frame is still
+    /// sitting there either way. So the worker owns this flag per orbit and
+    /// the renderer only reads it.
+    showing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    current_video: ?*video.VideoFile = null,
+
+    /// Decoders this orbit stopped using but could not close yet, because the
+    /// renderer was still uploading one of their frames. Drained by the orbit's
+    /// worker.
+    retired: [MAX_VIDEOS_PER_ORBIT]?*video.VideoFile = @splat(null),
+
+    // Bounds of the slice the current trigger asked for, owned by this orbit's
+    // worker and therefore lock-free. `null` means "no bound".
+    stop_position_seconds: ?f64 = null,
+    stop_at_ns: ?u64 = null,
+    slice_finished: bool = false,
+
+    /// Playback rate of the active trigger, sign carrying the direction. Read
+    /// and written by the orbit's worker only.
+    speed: f64 = 1,
+
+    /// When this orbit's finished slice should actually go black, or null when
+    /// no blackout is pending.
+    ///
+    /// A pattern retriggers back to back, so the moment a slice reaches its
+    /// `end` or `duration` bound the next event is usually already on its way.
+    /// Going black right then drops the picture for exactly that gap, and the
+    /// gap lands mid display refresh often enough to read as a flicker on
+    /// every single event. The orbit therefore holds its last frame instead, a
+    /// new trigger cancels the pending blackout, and only a pattern that
+    /// genuinely stops never reaches it.
+    blackout_at_ns: ?u64 = null,
 };
 
 pub const Player = struct {
@@ -89,45 +162,13 @@ pub const Player = struct {
     mutex: std.Io.Mutex = .init,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    /// Whether a picture should be on screen right now. The render loop runs
-    /// on its own thread and has to know the difference between "waiting for
-    /// the next frame of a playing clip" and "playback is over, show nothing".
-    /// The mailbox cannot answer that: its last frame is still sitting there
-    /// either way. So the worker owns this flag and the renderer only reads it.
-    showing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// One voice per orbit, all running at once. Invariant: the only writer of
+    /// the per-orbit trigger/region (the OSC thread) and the per-orbit worker
+    /// both go through `mutex` for the fields they share; the rest is either
+    /// worker-owned or an atomic.
+    orbits: [MAX_ORBITS]Orbit = @splat(.{}),
 
-    command: CommandState = .{},
-
-    current_video: ?usize = null,
-
-    videos: [MAX_VIDEOS]?*video.VideoFile = @splat(null),
-
-    worker: ?std.Thread = null,
-
-    applied_trigger_generation: u64 = 0,
-
-    // Bounds of the slice the current trigger asked for, owned by the video
-    // worker and therefore lock-free. `null` means "no bound".
-    stop_position_seconds: ?f64 = null,
-    stop_at_ns: ?u64 = null,
-    slice_finished: bool = false,
-
-    /// Playback rate of the active trigger, with its sign carrying the
-    /// direction. Read by the worker only, written when a trigger is applied.
-    speed: f64 = 1,
-
-    /// When a finished slice should actually go black, or null when no
-    /// blackout is pending.
-    ///
-    /// A pattern retriggers back to back, so the moment a slice reaches its
-    /// `end` or `duration` bound the next event is usually already on its way.
-    /// Going black right then drops the picture for exactly that gap, and the
-    /// gap is a few milliseconds wide and lands mid display refresh often
-    /// enough to read as a flicker on every single event. The picture
-    /// therefore holds its last frame instead, a new trigger cancels the
-    /// pending blackout, and only a pattern that genuinely stops ever reaches
-    /// it.
-    blackout_at_ns: ?u64 = null,
+    worker_threads: [MAX_ORBITS]?std.Thread = @splat(null),
 
     /// Root that holds the collections. Required, and fixed for the lifetime
     /// of the process, so it is borrowed from the command line rather than
@@ -158,29 +199,45 @@ pub const Player = struct {
     pub fn start(self: *Player) !void {
         self.running.store(true, .release);
 
-        self.worker = try std.Thread.spawn(
-            .{},
-            workerMain,
-            .{self},
-        );
+        // One worker per orbit, alive for the lifetime of the process. They
+        // sleep between frames, so eight mostly-idle decoders on the same
+        // 1080p all-I material is well within budget, and a live pattern never
+        // pays for spawning a thread in the hot path.
+        for (0..MAX_ORBITS) |i| {
+            self.orbits[i].index = i;
+            self.worker_threads[i] = try std.Thread.spawn(
+                .{},
+                workerMain,
+                .{ self, i },
+            );
+        }
     }
 
     pub fn stop(self: *Player) void {
         self.running.store(false, .release);
 
-        if (self.worker) |thread| {
-            thread.join();
-            self.worker = null;
+        for (&self.worker_threads) |*slot| {
+            if (slot.*) |thread| {
+                thread.join();
+                slot.* = null;
+            }
         }
     }
 
     pub fn deinit(self: *Player) void {
         self.stop();
 
-        for (&self.videos) |*entry| {
-            if (entry.*) |v| {
+        for (&self.orbits) |*orbit| {
+            if (orbit.current_video) |v| {
                 v.close();
-                entry.* = null;
+                orbit.current_video = null;
+            }
+
+            for (&orbit.retired) |*entry| {
+                if (entry.*) |v| {
+                    v.close();
+                    entry.* = null;
+                }
             }
         }
 
@@ -194,10 +251,15 @@ pub const Player = struct {
         self.collections.deinit(self.allocator);
     }
 
-    /// Apply one OSC event. Every parameter is optional: an empty name keeps
-    /// the current clip, so `begin` alone can re-slice what is already
-    /// playing, and a trigger with nothing but a name just plays it from the
-    /// start.
+    /// Apply one OSC event to one orbit. Every cinematic parameter is
+    /// optional: an empty name keeps the orbit's current clip, so `begin`
+    /// alone can re-slice what is already playing, and a trigger with nothing
+    /// but a name just plays it from the start.
+    ///
+    /// `orbit` names the voice; out of range it names nothing, so the whole
+    /// event is dropped rather than guessed at. `x`/`y`/`size` are optional
+    /// and sticky: an event that carries them moves this orbit's region, one
+    /// that does not leaves it where it was.
     pub fn requestTrigger(
         self: *Player,
         name: []const u8,
@@ -208,27 +270,44 @@ pub const Player = struct {
         speed: f64,
         unit: []const u8,
         cps: f64,
+        orbit: i32,
+        x: ?f64,
+        y: ?f64,
+        size: ?f64,
     ) void {
         if (name.len >= MAX_NAME) {
             std.log.warn("s: name too long ({d} bytes); ignored", .{name.len});
             return;
         }
 
+        if (orbit < 0 or orbit >= MAX_ORBITS) {
+            std.log.warn(
+                "orbit {d} is out of range [0..{d}]; event ignored",
+                .{ orbit, MAX_ORBITS - 1 },
+            );
+            return;
+        }
+
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
+        const target_orbit = &self.orbits[@intCast(orbit)];
+
         if (name.len > 0) {
-            @memcpy(self.command.trigger.name[0..name.len], name);
+            @memcpy(
+                target_orbit.trigger.name[0..name.len],
+                name,
+            );
         }
 
-        self.command.trigger.name_len = name.len;
-        self.command.trigger.begin = clampUnit(begin);
-        self.command.trigger.end = clampUnit(end);
+        target_orbit.trigger.name_len = name.len;
+        target_orbit.trigger.begin = clampUnit(begin);
+        target_orbit.trigger.end = clampUnit(end);
         // `n` is optional and defaults to 0, so an absent `n` and an explicit
         // `n 0` are the same request. The sign is kept because `n` wraps: a
         // negative index counts back from the last clip, and collapsing it to
         // 0 here would make every negative `n` play the first clip instead.
-        self.command.trigger.n = if (n) |value| blk: {
+        target_orbit.trigger.n = if (n) |value| blk: {
             if (!std.math.isFinite(value)) break :blk 0;
 
             // Clamped rather than wrapped so the narrowing cast below cannot
@@ -243,31 +322,55 @@ pub const Player = struct {
                 max_n,
             )));
         } else 0;
-        self.command.trigger.duration = @max(duration, 0);
+        target_orbit.trigger.duration = @max(duration, 0);
         // Only the sign and magnitude matter; the magnitude is clamped so an
         // absurd rate cannot make the pacing deadline wrap around.
-        self.command.trigger.speed = std.math.clamp(speed, -max_speed, max_speed);
-        self.command.trigger.unit = if (std.mem.eql(u8, unit, "c"))
+        target_orbit.trigger.speed = std.math.clamp(speed, -max_speed, max_speed);
+        target_orbit.trigger.unit = if (std.mem.eql(u8, unit, "c"))
             .cycles
         else if (std.mem.eql(u8, unit, "s"))
             .seconds
         else
             .rate;
-        self.command.trigger.cps = cps;
-        self.command.trigger.generation += 1;
+        target_orbit.trigger.cps = cps;
+
+        // `size` first: `x`/`y` are clamped against it, so an event carrying
+        // all three has to commit to the scale before the offsets are pinned
+        // into the screen.
+        if (size) |value| {
+            target_orbit.region.size = clampUnit(value);
+        }
+        if (x) |value| {
+            target_orbit.region.x = @min(
+                clampUnit(value),
+                1 - target_orbit.region.size,
+            );
+        }
+        if (y) |value| {
+            target_orbit.region.y = @min(
+                clampUnit(value),
+                1 - target_orbit.region.size,
+            );
+        }
+
+        target_orbit.trigger.generation += 1;
 
         std.log.info(
-            "TRIGGER #{d} s={s} begin={d:.4} end={d:.4} n={d} duration={d:.3} speed={d:.3} unit={s} cps={d:.4}",
+            "TRIGGER #{d} orbit={d} s={s} begin={d:.4} end={d:.4} n={d} duration={d:.3} speed={d:.3} unit={s} cps={d:.4} rect=({d:.3},{d:.3},{d:.3})",
             .{
-                self.command.trigger.generation,
+                target_orbit.trigger.generation,
+                orbit,
                 if (name.len > 0) name else "",
-                self.command.trigger.begin,
-                self.command.trigger.end,
-                self.command.trigger.n,
-                self.command.trigger.duration,
-                self.command.trigger.speed,
+                target_orbit.trigger.begin,
+                target_orbit.trigger.end,
+                target_orbit.trigger.n,
+                target_orbit.trigger.duration,
+                target_orbit.trigger.speed,
                 unit,
-                self.command.trigger.cps,
+                target_orbit.trigger.cps,
+                target_orbit.region.x,
+                target_orbit.region.y,
+                target_orbit.region.size,
             },
         );
     }
@@ -477,16 +580,35 @@ pub const Player = struct {
         return paths[@intCast(index)];
     }
 
-    /// True while a clip is playing. False before the first trigger and after
-    /// a slice ends, which is when the window must go black.
-    pub fn showsFrame(self: *Player) bool {
-        return self.showing.load(.acquire);
+    /// True while this orbit has a picture. False before its first trigger and
+    /// after a slice ends, which is when its region must go black.
+    pub fn orbitShowsFrame(self: *Player, index: usize) bool {
+        return self.orbits[index].showing.load(.acquire);
+    }
+
+    /// The orbit's current region, as normalized values. Read under the mutex
+    /// because the OSC thread owns it.
+    pub fn orbitRegion(self: *Player, index: usize) Region {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        return self.orbits[index].region;
     }
 
     pub fn takeLatestFrame(
         self: *Player,
+        index: usize,
     ) ?video.FrameHandle {
-        const active = self.activeVideo() orelse return null;
+        // Reading the orbit's current video and taking a slot from it are one
+        // critical section. If the orbit's worker swapped clips between the
+        // two, it might legally close the video this frame belongs to; taking
+        // under the same lock means every access to a `VideoFile` from here is
+        // ordered against the swap, and the mailbox's `displaying` slot guards
+        // the upload below.
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        const active = self.orbits[index].current_video orelse return null;
         return active.takeLatestFrame();
     }
 
@@ -494,79 +616,52 @@ pub const Player = struct {
         _: *Player,
         frame: video.FrameHandle,
     ) void {
-        // The handle names the mailbox it came from, so a clip switch between
-        // take and release cannot make this return the slot to the wrong one.
+        // The handle names the mailbox it came from, so an orbit switching
+        // clips between take and release cannot make this return the slot to
+        // the wrong one.
         frame.owner.release();
     }
 
-    /// The clip the pattern is currently playing, or null before the first
-    /// load. Entries are only ever set from null and closed at shutdown, so a
-    /// pointer read here stays valid for the rest of the process.
-    fn activeVideo(
-        self: *Player,
-    ) ?*video.VideoFile {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+    /// The clip this orbit is currently playing, or null before its first
+    /// load. Guarded by the mutex because the orbit's worker assigns it, and
+    /// because `takeLatestFrame` needs the read and the take to be one atomic
+    /// step against a clip swap.
+    fn workerMain(self: *Player, orbit_index: usize) void {
+        std.log.info("orbit {d}: video worker started", .{orbit_index});
 
-        const index = self.current_video orelse return null;
-        return self.videos[index];
-    }
-
-    fn assignActive(
-        self: *Player,
-        index: usize,
-    ) void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-
-        self.current_video = index;
-    }
-
-    fn workerMain(self: *Player) void {
-        std.log.info("video worker started", .{});
+        const o = &self.orbits[orbit_index];
 
         var last_pts: ?i64 = null;
         var deadline_ns: u64 = 0;
 
         while (self.running.load(.acquire)) {
-            var load_path: ?[]u8 = null;
+            // Close any decoder this orbit gave up on earlier, now that the
+            // renderer can no longer be holding one of its frames.
+            for (&o.retired) |*entry| {
+                if (entry.*) |v| {
+                    if (!v.mailbox.hasDisplaying()) {
+                        v.close();
+                        entry.* = null;
+                    }
+                }
+            }
+
             var trigger: ?TriggerState = null;
 
-            var local_path: [MAX_PATH]u8 = undefined;
-
             self.mutex.lockUncancelable(self.io);
-
-            if (self.command.load_pending) {
-                @memcpy(
-                    local_path[0..self.command.load_path_len],
-                    self.command.load_path[0..self.command.load_path_len],
-                );
-
-                load_path = local_path[0..self.command.load_path_len];
-                self.command.load_pending = false;
-            }
 
             // Not marked applied here on purpose: an event that arrives while
             // a clip is still opening has to stay pending until the worker can
             // act on it as a whole.
-            if (self.command.trigger.generation !=
-                self.applied_trigger_generation)
-            {
-                trigger = self.command.trigger;
+            if (o.trigger.generation != o.applied_trigger_generation) {
+                trigger = o.trigger;
             }
 
             self.mutex.unlock(self.io);
 
-            if (load_path) |path| {
-                self.handleLoad(path);
-                last_pts = null;
-                deadline_ns = 0;
-                continue;
-            }
-
             if (trigger) |t| {
                 self.mutex.lockUncancelable(self.io);
-                self.applied_trigger_generation = t.generation;
+                o.applied_trigger_generation = t.generation;
                 self.mutex.unlock(self.io);
 
                 if (t.name_len > 0 or t.n > 0) {
@@ -598,34 +693,34 @@ pub const Player = struct {
                     };
 
                     if (resolved) |path| {
-                        self.activatePath(path);
+                        self.activatePath(orbit_index, path);
                     }
                 }
 
                 // A new event always resumes playback and restarts pacing, and
                 // it cancels a blackout the previous slice had scheduled: two
                 // adjacent events must never put a black frame between them.
-                self.slice_finished = false;
-                self.blackout_at_ns = null;
+                o.slice_finished = false;
+                o.blackout_at_ns = null;
                 last_pts = null;
                 deadline_ns = 0;
 
-                self.stop_position_seconds = null;
-                self.stop_at_ns = null;
+                o.stop_position_seconds = null;
+                o.stop_at_ns = null;
 
                 if (t.duration > 0) {
-                    self.stop_at_ns = util.nowNs(self.io) + @as(
+                    o.stop_at_ns = util.nowNs(self.io) + @as(
                         u64,
                         @intFromFloat(t.duration * 1_000_000_000.0),
                     );
                 }
 
-                self.speed = t.speed;
+                o.speed = t.speed;
 
-                const target = self.activeVideo() orelse {
+                const target = o.current_video orelse {
                     std.log.warn(
-                        "trigger #{d} ignored: no clip to play",
-                        .{t.generation},
+                        "trigger #{d}: no clip to play on orbit {d}",
+                        .{ t.generation, orbit_index },
                     );
                     continue;
                 };
@@ -652,19 +747,19 @@ pub const Player = struct {
                 // The `rate` unit never reaches this code, since the wire
                 // value was already clamped before being stored.
                 if (t.unit == .cycles) {
-                    self.speed = std.math.clamp(
-                        target.duration_seconds * self.speed * t.cps,
+                    o.speed = std.math.clamp(
+                        target.duration_seconds * o.speed * t.cps,
                         -max_speed,
                         max_speed,
                     );
                 } else if (t.unit == .seconds) {
-                    if (self.speed == 0) {
+                    if (o.speed == 0) {
                         // An empty window is the speed-0 hold, not an
                         // unbounded rate; keep the degenerate case intact.
-                        self.speed = 0;
+                        o.speed = 0;
                     } else {
-                        self.speed = std.math.clamp(
-                            target.duration_seconds / self.speed,
+                        o.speed = std.math.clamp(
+                            target.duration_seconds / o.speed,
                             -max_speed,
                             max_speed,
                         );
@@ -679,14 +774,7 @@ pub const Player = struct {
                 //     if(~speed < 0) { temp = ~end; ~end = ~begin; ~begin = temp }
                 //
                 // A pattern therefore always describes a slice as begin < end
-                // and lets the sign of speed say which way it is read. Reading
-                // the pair literally instead is what made every reverse slice
-                // wrong in two separate ways: with the default begin 0 / end 1
-                // it seeked to 0 and then ran off the front of the clip on the
-                // first step, which is a black screen; and with a real pair
-                // like begin 0.5 end 0.75, `end` sits ahead in the direction of
-                // travel, so the bound was silently dropped and the slice ran
-                // all the way back to the start of the clip.
+                // and lets the sign of speed say which way it is read.
                 var begin = t.begin;
                 var end = t.end;
 
@@ -713,7 +801,7 @@ pub const Player = struct {
                 // `end` is behind its `begin` has no far end: it is bound only
                 // by `duration`, and runs to the start of the clip.
                 if (end > begin) {
-                    self.stop_position_seconds = end * target.duration_seconds;
+                    o.stop_position_seconds = end * target.duration_seconds;
                 }
 
                 const start_ns = util.nowNs(self.io);
@@ -731,18 +819,19 @@ pub const Player = struct {
                 // The seek has already published the target frame, so there is
                 // now something real to show. Raising the flag here rather than
                 // at the top of the trigger is what keeps the renderer from
-                // putting a previous clip's last frame on screen while a new
+                // putting a later clip's last frame in this orbit while a new
                 // clip is still being opened.
-                self.showing.store(true, .release);
+                o.showing.store(true, .release);
 
                 std.log.info(
-                    "trigger #{d} began at {d:.3}s / {d:.3}s, frame_pts={d}, speed={d:.3}, latency={d:.2}ms",
+                    "orbit {d}: trigger #{d} began at {d:.3}s / {d:.3}s, frame_pts={d}, speed={d:.3}, latency={d:.2}ms",
                     .{
+                        orbit_index,
                         t.generation,
                         meta.position_seconds,
                         target.duration_seconds,
                         meta.pts,
-                        self.speed,
+                        o.speed,
                         @as(f64, @floatFromInt(util.nowNs(self.io) - start_ns)) /
                             1_000_000.0,
                     },
@@ -752,18 +841,19 @@ pub const Player = struct {
                 continue;
             }
 
-            const v = self.activeVideo() orelse {
+            const v = o.current_video orelse {
                 util.sleepNs(self.io, 1_000_000);
                 continue;
             };
 
-            if (self.slice_finished) {
-                // The grace period is up and no new event claimed the window,
-                // so the slice really is over: now, and only now, black.
-                if (self.blackout_at_ns) |at| {
+            if (o.slice_finished) {
+                // The grace period is up and no new event claimed this orbit's
+                // window, so the slice really is over: now, and only now, black
+                // this orbit's region.
+                if (o.blackout_at_ns) |at| {
                     if (util.nowNs(self.io) >= at) {
-                        self.showing.store(false, .release);
-                        self.blackout_at_ns = null;
+                        o.showing.store(false, .release);
+                        o.blackout_at_ns = null;
                     }
                 }
 
@@ -779,10 +869,10 @@ pub const Player = struct {
             // division below from dividing by zero. Only `duration` can end
             // such a slice: the timeline never travels, so an `end` bound is
             // a position it can never arrive at.
-            if (self.speed == 0) {
+            if (o.speed == 0) {
                 util.sleepNs(self.io, 1_000_000);
 
-                if (self.stop_at_ns) |deadline| {
+                if (o.stop_at_ns) |deadline| {
                     if (util.nowNs(self.io) >= deadline) {
                         // Report where the picture actually is, not zero, or
                         // the log claims the slice fell off the front of the
@@ -792,14 +882,14 @@ pub const Player = struct {
                         else
                             0;
 
-                        self.finishSlice("reached duration", held);
+                        finishSlice(o, self.io, "reached duration", held);
                     }
                 }
 
                 continue;
             }
 
-            const reversing = self.speed < 0;
+            const reversing = o.speed < 0;
 
             const stepped = blk: {
                 if (reversing) {
@@ -809,8 +899,10 @@ pub const Player = struct {
                         if (err == error.StartOfClip) {
                             // Running off the front of the clip ends the slice
                             // the same way running off the end does: the sample
-                            // has played out, so the picture goes black.
-                            self.finishSlice(
+                            // has played out, so the region goes black.
+                            finishSlice(
+                                o,
+                                self.io,
                                 "reached the start of the clip",
                                 0,
                             );
@@ -830,9 +922,11 @@ pub const Player = struct {
                     if (err == error.EndOfStream) {
                         // A sample plays its slice once and waits for the next
                         // event; looping on its own would fight the pattern
-                        // that drives zap. finishSlice takes the picture to
-                        // black.
-                        self.finishSlice(
+                        // that drives zap. finishSlice takes this orbit's
+                        // region to black.
+                        finishSlice(
+                            o,
+                            self.io,
                             "reached the end of the clip",
                             v.duration_seconds,
                         );
@@ -875,7 +969,7 @@ pub const Player = struct {
                     // At speed 1 that is the source frame interval; at speed 2
                     // the same content interval is shown in half the time.
                     const interval_ns: u64 = @intFromFloat(
-                        delta_seconds * 1_000_000_000.0 / @abs(self.speed),
+                        delta_seconds * 1_000_000_000.0 / @abs(o.speed),
                     );
 
                     // Pace against an absolute deadline instead of sleeping a
@@ -907,21 +1001,21 @@ pub const Player = struct {
             // clears them. The position test has to follow the direction of
             // travel, because under reverse the position is counting down and
             // a `>=` test would never fire.
-            if (self.stop_position_seconds) |stop_position| {
+            if (o.stop_position_seconds) |stop_position| {
                 const reached = if (reversing)
                     meta.position_seconds <= stop_position
                 else
                     meta.position_seconds >= stop_position;
 
                 if (reached) {
-                    self.finishSlice("reached end", meta.position_seconds);
+                    finishSlice(o, self.io, "reached end", meta.position_seconds);
                     continue;
                 }
             }
 
-            if (self.stop_at_ns) |deadline| {
+            if (o.stop_at_ns) |deadline| {
                 if (util.nowNs(self.io) >= deadline) {
-                    self.finishSlice("reached duration", meta.position_seconds);
+                    finishSlice(o, self.io, "reached duration", meta.position_seconds);
                     continue;
                 }
             }
@@ -938,63 +1032,62 @@ pub const Player = struct {
             }
         }
 
-        std.log.info("video worker stopped", .{});
+        std.log.info("orbit {d}: video worker stopped", .{orbit_index});
     }
 
-    /// Stop at the current frame and keep showing it, the way a sample goes
-    /// silent after its slice instead of restarting on its own.
+    /// Stop this orbit at the current frame and keep showing it, the way a sample
+    /// goes silent after its slice instead of restarting on its own. Only this
+    /// orbit's picture is affected; every other orbit keeps drawing.
     fn finishSlice(
-        self: *Player,
+        o: *Orbit,
+        io: std.Io,
         reason: []const u8,
         position: f64,
     ) void {
-        if (self.slice_finished) return;
+        if (o.slice_finished) return;
 
-        self.slice_finished = true;
+        o.slice_finished = true;
 
         // The picture does NOT go black here. A sample that has played its
         // slice goes silent, but the next event is normally already on its
         // way, and cutting to black for the gap between them is a black flash
         // on every event. So the frame holds and the blackout is scheduled
         // instead: a new trigger cancels it, and only a pattern that has
-        // really stopped ever gets a black window.
-        self.blackout_at_ns = util.nowNs(self.io) + blackout_grace_ns;
+        // really stopped ever gets a black region.
+        o.blackout_at_ns = util.nowNs(io) + blackout_grace_ns;
 
         std.log.info(
-            "slice finished at {d:.3}s: {s}",
-            .{ position, reason },
+            "orbit {d}: slice finished at {d:.3}s: {s}",
+            .{ o.index, position, reason },
         );
     }
 
-    /// Make `path` the active clip, reusing an already opened one. A pattern
-    /// can retrigger the same sample many times a second, so reopening the
-    /// file per event would churn decoders and fill the slot table.
+    /// Make `path` the current clip of one orbit, reusing the decoder that
+    /// orbit already has for it. A pattern can retrigger the same sample many
+    /// times a second, so reopening the file per event would churn decoders.
+    ///
+    /// The cache is per orbit, not global: a global decoder can only serve one
+    /// playhead, and two orbits may be playing the same clip at different
+    /// positions at the same time.
     fn activatePath(
         self: *Player,
+        orbit_index: usize,
         path: []const u8,
     ) void {
-        for (self.videos, 0..) |entry, i| {
-            if (entry) |v| {
-                if (std.mem.eql(u8, v.path, path)) {
-                    self.assignActive(i);
+        const o = &self.orbits[orbit_index];
 
-                    std.log.info(
-                        "active video index={d} path={s}",
-                        .{ i, v.path },
-                    );
+        self.mutex.lockUncancelable(self.io);
+        const already = if (o.current_video) |v|
+            std.mem.eql(u8, v.path, path)
+        else
+            false;
+        self.mutex.unlock(self.io);
 
-                    return;
-                }
-            }
-        }
+        if (already) return;
 
-        self.handleLoad(path);
-    }
-
-    fn handleLoad(
-        self: *Player,
-        path: []const u8,
-    ) void {
+        // Open the replacement before touching the current one, so a clip that
+        // cannot be opened leaves this orbit's picture exactly where it was:
+        // half-applying a load would restart nothing, it would go black.
         const new_video =
             video.VideoFile.open(
                 self.io,
@@ -1002,41 +1095,63 @@ pub const Player = struct {
                 path,
             ) catch |err| {
                 std.log.err(
-                    "LOAD failed path={s}: {s}",
-                    .{
-                        path,
-                        @errorName(err),
-                    },
+                    "orbit {d}: LOAD failed path={s}: {s}",
+                    .{ orbit_index, path, @errorName(err) },
                 );
                 return;
             };
 
-        var index: ?usize = null;
+        // Swap under the mutex, atomically against the renderer's take. The
+        // old video is then retired out of the critical section; it can only
+        // be closed once no slot from it is `displaying`.
+        self.mutex.lockUncancelable(self.io);
+        const previous = o.current_video;
+        o.current_video = new_video;
+        self.mutex.unlock(self.io);
 
-        for (&self.videos, 0..) |*entry, i| {
-            if (entry.* == null) {
-                index = i;
-                entry.* = new_video;
-                break;
+        if (previous) |old| {
+            recycleVideo(o, old);
+        }
+
+        std.log.info(
+            "orbit {d}: loaded video path={s}",
+            .{ orbit_index, path },
+        );
+    }
+
+    /// Delay `old`'s close or close it immediately, whichever is safe. The
+    /// renderer may be uploading one of this video's frames right now, and a
+    /// mailbox with a `displaying` slot must outlive that upload, so such a
+    /// video is parked in `retired` and closed by the orbit's worker once the
+    /// slot frees.
+    fn recycleVideo(
+        o: *Orbit,
+        old: *video.VideoFile,
+    ) void {
+        // Close anything already parked that has become safe, to make room.
+        for (&o.retired) |*entry| {
+            if (entry.*) |v| {
+                if (!v.mailbox.hasDisplaying()) {
+                    v.close();
+                    entry.* = null;
+                }
             }
         }
 
-        if (index == null) {
-            new_video.close();
-
-            std.log.err(
-                "video collection full ({d})",
-                .{MAX_VIDEOS},
-            );
-
-            return;
+        for (&o.retired) |*entry| {
+            if (entry.* == null) {
+                entry.* = old;
+                return;
+            }
         }
 
-        self.assignActive(index.?);
-
-        std.log.info(
-            "loaded video index={d} path={s}",
-            .{ index.?, path },
+        // Every parked decoder is still in use and the queue is full. The
+        // renderer would have to be stalled well past a refresh for this to
+        // happen; the safe move is to leave the decoder open until shutdown
+        // rather than free memory the renderer could still be reading.
+        std.log.warn(
+            "orbit {d}: retired video queue full; a decoder stays open until shutdown",
+            .{o.index},
         );
     }
 };
