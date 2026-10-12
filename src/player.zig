@@ -116,8 +116,9 @@ const Orbit = struct {
     trigger: TriggerState = .{},
     applied_trigger_generation: u64 = 0,
 
-    /// Sticky: an event updates a field only when the event carried it, so a
-    /// sparse pattern does not yank an orbit back to full screen.
+    /// Replaced on every event rather than accumulated: a parameter the event
+    /// did not carry falls back to its default, so the region always describes
+    /// the event that is playing now.
     region: Region = .{},
 
     /// Whether this orbit's picture should be on screen right now. The render
@@ -261,8 +262,9 @@ pub const Player = struct {
     ///
     /// `orbit` names the voice; out of range it names nothing, so the whole
     /// event is dropped rather than guessed at. `x`/`y`/`size` are optional
-    /// and sticky: an event that carries them moves this orbit's region, one
-    /// that does not leaves it where it was.
+    /// and describe the region for this event only: one that is absent falls
+    /// back to its default (0, 0, 1), so an event with no region is full
+    /// screen even if the previous event had shrunk or moved the picture.
     pub fn requestTrigger(
         self: *Player,
         name: []const u8,
@@ -337,21 +339,21 @@ pub const Player = struct {
             .rate;
         target_orbit.trigger.cps = cps;
 
-        // The region is deliberately unbounded: `x`/`y` may be negative or
+        // The region is rebuilt from this event on every trigger. A parameter
+        // the event did not carry keeps the default from `Region{ .{} }`, so
+        // the region never lingers from an earlier event.
+        //
+        // The values are deliberately unbounded: `x`/`y` may be negative or
         // past the screen and `size` may exceed 1, because the picture is
         // anchored at its top-left and the renderer clips whatever leaves the
         // canvas. Only a non-finite value is refused, since it would poison
         // the destination rect; a negative `size` is floored at 0 so the
         // renderer never gets a negative width.
-        if (size) |value| {
-            target_orbit.region.size = @max(finiteOrZero(value), 0);
-        }
-        if (x) |value| {
-            target_orbit.region.x = finiteOrZero(value);
-        }
-        if (y) |value| {
-            target_orbit.region.y = finiteOrZero(value);
-        }
+        var region = Region{};
+        if (x) |value| region.x = finiteOrZero(value);
+        if (y) |value| region.y = finiteOrZero(value);
+        if (size) |value| region.size = @max(finiteOrZero(value), 0);
+        target_orbit.region = region;
 
         target_orbit.trigger.generation += 1;
 

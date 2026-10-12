@@ -327,10 +327,12 @@ picture off the left or top edge, and a `size` above `1` magnifies it, so
 The renderer clips everything outside the canvas, so any value is safe to
 send.
 
-Regions are **sticky per orbit**: they only move when an event carries
-`x`/`y`/`size`, so a stream that positions itself once and then retriggers
-with `s` alone keeps its place. When `orbit` is omitted, the event plays on
-orbit 0 at full screen, so a single-clip zap behaves exactly as before.
+Regions are **per event, not sticky**: any of `x`/`y`/`size` the event does
+not carry falls back to its default (`0`, `0`, `1`), so a stream that
+positions itself once and then retriggers with `s` alone returns to full
+screen. Send `x`/`y`/`size` on every event that needs a region. When `orbit`
+is omitted, the event plays on orbit 0 at full screen, so a single-clip zap
+behaves exactly as before.
 
 ### Resolving `s`
 
