@@ -13,6 +13,7 @@ This is intentionally NOT a general-purpose media player.
 
 - Zig implementation
 - SDL3 window and rendering
+- optional borderless window (`--borderless`)
 - OSC UDP receiver
 - `/play` single-event trigger: SuperDirt key/value pairs, any order
 - parallel playback: up to 8 independent orbits, each its own worker thread
@@ -138,6 +139,12 @@ To play samples, point zap at a media directory:
 
 The media directory is mandatory and has no default, because without it
 there is nothing for a `/play` to name.
+
+Pass `--borderless` to drop the window decorations. The window keeps its
+1280x720 size and stays resizable, it just has no title bar or frame, which
+suits a projector feed or a video wall:
+
+    ./zig-out/bin/zap --borderless /Users/me/my-media
 
 ---
 

@@ -7,6 +7,8 @@ const benchmark = @import("benchmark.zig");
 
 const log = std.log.scoped(.main);
 
+const usage = "usage: zap [--benchmark] [--borderless] <media-dir>";
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const allocator = init.gpa;
@@ -16,6 +18,7 @@ pub fn main(init: std.process.Init) !void {
     var args = init.minimal.args.iterate();
 
     var benchmark_mode = false;
+    var borderless = false;
     var media_dir: ?[]const u8 = null;
 
     _ = args.next(); // executable name
@@ -26,15 +29,20 @@ pub fn main(init: std.process.Init) !void {
             continue;
         }
 
+        if (std.mem.eql(u8, arg, "--borderless")) {
+            borderless = true;
+            continue;
+        }
+
         if (std.mem.startsWith(u8, arg, "-")) {
             log.err("unknown option '{s}'", .{arg});
-            log.err("usage: zap [--benchmark] <media-dir>", .{});
+            log.err(usage, .{});
             return error.UnknownArgument;
         }
 
         if (media_dir != null) {
             log.err("unexpected extra argument '{s}'", .{arg});
-            log.err("usage: zap [--benchmark] <media-dir>", .{});
+            log.err(usage, .{});
             return error.UnexpectedArgument;
         }
 
@@ -47,7 +55,7 @@ pub fn main(init: std.process.Init) !void {
 
     const path = media_dir orelse {
         log.err("missing <media-dir>", .{});
-        log.err("usage: zap [--benchmark] <media-dir>", .{});
+        log.err(usage, .{});
         return error.MissingMediaDir;
     };
 
@@ -74,7 +82,7 @@ pub fn main(init: std.process.Init) !void {
 
     try player.start();
 
-    var renderer = try Renderer.init();
+    var renderer = try Renderer.init(borderless);
     defer renderer.deinit();
 
     var osc = OscServer.init(

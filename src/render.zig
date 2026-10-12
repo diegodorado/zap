@@ -22,7 +22,10 @@ pub const Renderer = struct {
     /// "never draw an unwritten texture" is a property of this function alone.
     has_frame: [player_mod.MAX_ORBITS]bool = @splat(false),
 
-    pub fn init() !Renderer {
+    /// `borderless` drops the window decorations, which is what a video wall
+    /// or a projector feed wants; the window keeps its size and position and
+    /// stays resizable, it just has no title bar or frame.
+    pub fn init(borderless: bool) !Renderer {
         if (!c.SDL_Init(c.SDL_INIT_VIDEO)) {
             log.err("SDL_Init failed: {s}", .{c.SDL_GetError()});
             return error.SdlInitFailed;
@@ -30,11 +33,16 @@ pub const Renderer = struct {
 
         errdefer c.SDL_Quit();
 
+        var window_flags: c.SDL_WindowFlags = c.SDL_WINDOW_RESIZABLE;
+        if (borderless) {
+            window_flags |= c.SDL_WINDOW_BORDERLESS;
+        }
+
         const window = c.SDL_CreateWindow(
             "zap",
             1280,
             720,
-            c.SDL_WINDOW_RESIZABLE,
+            window_flags,
         ) orelse {
             log.err("SDL_CreateWindow failed: {s}", .{c.SDL_GetError()});
             return error.SdlWindowFailed;
