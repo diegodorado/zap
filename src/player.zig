@@ -87,11 +87,12 @@ const TriggerState = struct {
 /// A normalized screen region. `x`/`y` are the top-left corner in normalized
 /// screen units and `size` is a scalar scale, so the region keeps the source's
 /// 16:9 shape: it is `size` of the width and `size` of the height of the
-/// 1920x1080 logical space. The picture is anchored at that corner and the
-/// screen clips whatever falls outside it, so a full-size region at (0.5, 0.5)
-/// shows only its top-left quarter. Each value is independently clamped to
-/// `0..1`. Defaults (0, 0, 1) are the full screen, which is what a `/play`
-/// without a region has always meant.
+/// 1920x1080 logical space.
+///
+/// None of the three is bounded. The picture is anchored at its top-left and
+/// the renderer clips whatever leaves the canvas, so `x`/`y` may be negative or
+/// past the screen and `size` may exceed 1 to magnify. Defaults (0, 0, 1) are
+/// the full screen, which is what a `/play` without a region has always meant.
 const Region = struct {
     x: f64 = 0,
     y: f64 = 0,
@@ -336,19 +337,20 @@ pub const Player = struct {
             .rate;
         target_orbit.trigger.cps = cps;
 
+        // The region is deliberately unbounded: `x`/`y` may be negative or
+        // past the screen and `size` may exceed 1, because the picture is
+        // anchored at its top-left and the renderer clips whatever leaves the
+        // canvas. Only a non-finite value is refused, since it would poison
+        // the destination rect; a negative `size` is floored at 0 so the
+        // renderer never gets a negative width.
         if (size) |value| {
-            target_orbit.region.size = clampUnit(value);
+            target_orbit.region.size = @max(finiteOrZero(value), 0);
         }
-        // `x`/`y` are the top-left corner and are independent of `size`: the
-        // picture is anchored there and simply clipped by the screen, so a
-        // full-size window at (0.5, 0.5) shows its top-left quarter rather
-        // than snapping back to the corner. Clamping them against `size` is
-        // what used to make `size 1.0` swallow `x`/`y` entirely.
         if (x) |value| {
-            target_orbit.region.x = clampUnit(value);
+            target_orbit.region.x = finiteOrZero(value);
         }
         if (y) |value| {
-            target_orbit.region.y = clampUnit(value);
+            target_orbit.region.y = finiteOrZero(value);
         }
 
         target_orbit.trigger.generation += 1;
@@ -1161,6 +1163,15 @@ fn lessThanBytes(_: void, a: []u8, b: []u8) bool {
 fn clampUnit(value: f64) f64 {
     if (std.math.isNan(value)) return 0;
     return std.math.clamp(value, 0, 1);
+}
+
+/// Pass a region value through untouched except for the one thing that cannot
+/// survive the trip to the renderer: a NaN or an infinity would make the
+/// destination rect non-finite. Everything else, including negatives and
+/// values past 1, is meaningful and is left for the canvas to clip.
+fn finiteOrZero(value: f64) f64 {
+    if (std.math.isFinite(value)) return value;
+    return 0;
 }
 
 /// The fastest playback rate accepted. Above 1 the frame interval shrinks in

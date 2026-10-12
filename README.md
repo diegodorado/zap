@@ -316,7 +316,16 @@ while a smaller one sits entirely in view:
     /play s "s" s "bd" s "orbit" i 1 s "x" f 0.5 s "y" f 0.5 s "size" f 1.0
 
 shows the top-left quarter of the frame, the rest cropped off the right and
-bottom. Each of `x`, `y` and `size` is clamped to `0..1` on its own.
+bottom.
+
+None of the three is bounded to `0..1`. A negative `x` or `y` pulls the
+picture off the left or top edge, and a `size` above `1` magnifies it, so
+`size 4.0` fills the canvas with a 4x-zoomed top-left quarter:
+
+    /play s "s" s "bd" s "orbit" i 1 s "x" f -0.5 s "size" f 4.0
+
+The renderer clips everything outside the canvas, so any value is safe to
+send.
 
 Regions are **sticky per orbit**: they only move when an event carries
 `x`/`y`/`size`, so a stream that positions itself once and then retriggers
