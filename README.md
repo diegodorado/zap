@@ -306,9 +306,17 @@ canvas. `x`/`y` are the top-left corner in normalized coordinates and
     /play s "s" s "bd" s "orbit" i 1 s "x" f 0.5 s "y" f 0.5 s "size" f 0.25
 
 places a quarter-height, 16:9 window whose top-left is at the center of the
-screen. The region is clamped to stay on screen (`x`/`y` first shrink to
-`0..1 - size`, after `size` itself is clamped to `0..1`), so a region never
-hangs off the edge.
+screen.
+
+The picture is always drawn **from its top-left corner**, and `x`/`y` are
+independent of `size`: the screen simply clips whatever falls past its edge.
+A full-size window at `x`/`y` `0.5` therefore shows only its top-left quarter,
+while a smaller one sits entirely in view:
+
+    /play s "s" s "bd" s "orbit" i 1 s "x" f 0.5 s "y" f 0.5 s "size" f 1.0
+
+shows the top-left quarter of the frame, the rest cropped off the right and
+bottom. Each of `x`, `y` and `size` is clamped to `0..1` on its own.
 
 Regions are **sticky per orbit**: they only move when an event carries
 `x`/`y`/`size`, so a stream that positions itself once and then retriggers

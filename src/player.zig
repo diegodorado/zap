@@ -84,11 +84,13 @@ const TriggerState = struct {
     cps: f64 = 0,
 };
 
-/// A normalized screen region. `size` is a scalar scale, so the region keeps
-/// the source's 16:9 shape: it is `size` of the width and `size` of the height
-/// of the 1920x1080 logical space. `x`/`y` are the top-left in normalized
-/// screen units. As normalized values each is clamped so the rect stays inside
-/// the screen. Defaults (0, 0, 1) are the full screen, which is what a `/play`
+/// A normalized screen region. `x`/`y` are the top-left corner in normalized
+/// screen units and `size` is a scalar scale, so the region keeps the source's
+/// 16:9 shape: it is `size` of the width and `size` of the height of the
+/// 1920x1080 logical space. The picture is anchored at that corner and the
+/// screen clips whatever falls outside it, so a full-size region at (0.5, 0.5)
+/// shows only its top-left quarter. Each value is independently clamped to
+/// `0..1`. Defaults (0, 0, 1) are the full screen, which is what a `/play`
 /// without a region has always meant.
 const Region = struct {
     x: f64 = 0,
@@ -334,23 +336,19 @@ pub const Player = struct {
             .rate;
         target_orbit.trigger.cps = cps;
 
-        // `size` first: `x`/`y` are clamped against it, so an event carrying
-        // all three has to commit to the scale before the offsets are pinned
-        // into the screen.
         if (size) |value| {
             target_orbit.region.size = clampUnit(value);
         }
+        // `x`/`y` are the top-left corner and are independent of `size`: the
+        // picture is anchored there and simply clipped by the screen, so a
+        // full-size window at (0.5, 0.5) shows its top-left quarter rather
+        // than snapping back to the corner. Clamping them against `size` is
+        // what used to make `size 1.0` swallow `x`/`y` entirely.
         if (x) |value| {
-            target_orbit.region.x = @min(
-                clampUnit(value),
-                1 - target_orbit.region.size,
-            );
+            target_orbit.region.x = clampUnit(value);
         }
         if (y) |value| {
-            target_orbit.region.y = @min(
-                clampUnit(value),
-                1 - target_orbit.region.size,
-            );
+            target_orbit.region.y = clampUnit(value);
         }
 
         target_orbit.trigger.generation += 1;
